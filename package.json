@@ -1,0 +1,45 @@
+{
+  "name": "@eyevinn/xledger-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Xledger GraphQL API — read-only access to accounting data (AR, AP, GL, projects, timesheets, employees)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "xledger-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "xledger",
+    "graphql",
+    "accounting",
+    "erp",
+    "claude"
+  ],
+  "author": "Eyevinn Technology <info@eyevinn.se> (https://www.eyevinn.se)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eyevinn/xledger-mcp-server.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0",
+    "vitest": "^2.0.0"
+  }
+}
