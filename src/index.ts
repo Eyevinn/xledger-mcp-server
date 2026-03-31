@@ -657,6 +657,365 @@ server.tool(
   }
 );
 
+// ─── Tool: get_budget_vs_actual ──────────────────────────────────────────────
+
+server.tool(
+  "get_budget_vs_actual",
+  "Compare budget vs actual (utfall) for a fiscal year. Returns budget amounts and actual GL balances per account with variance. Use for CFO budget follow-up and forecast deviation analysis.",
+  {
+    fiscalYear: z
+      .number()
+      .optional()
+      .describe("Fiscal year (e.g. 2026). Defaults to current year."),
+    periodNumber: z
+      .number()
+      .optional()
+      .describe("Limit to a specific period 1-12. Returns YTD if omitted."),
+    first: z
+      .number()
+      .optional()
+      .default(200)
+      .describe("Max account rows to return"),
+  },
+  { readOnlyHint: true, openWorldHint: true },
+  async ({ fiscalYear, periodNumber, first }) => {
+    const year = fiscalYear || new Date().getFullYear();
+
+    // Budget balances — no fiscalYear filter in API, filter client-side
+    const budgetData = await gql(`{
+      budgetBalances(first: 500, orderBy: [{ field: PERIOD_ID, direction: DESC }]) {
+        edges { node { fiscalYear periodNumber amount account { code description } } }
+      }
+    }`);
+
+    let budgetItems: Record<string, any>[] = budgetData.budgetBalances.edges
+      .map((e: { node: Record<string, any> }) => e.node)
+      .filter((b: Record<string, any>) => b.fiscalYear === year);
+    if (periodNumber) budgetItems = budgetItems.filter((b) => b.periodNumber === periodNumber);
+
+    // Actual balances — same pagination pattern as get_account_balances
+    const pageSize = 500;
+    let actualItems: Record<string, any>[] = [];
+    for (let page = 0; page < 6; page++) {
+      const offset = page * pageSize;
+      const offsetClause = offset > 0 ? `, offset: ${offset}` : "";
+      const data = await gql(`{
+        accountBalances(first: ${pageSize}${offsetClause}, orderBy: [{ field: PERIOD_ID, direction: DESC }]) {
+          edges { node { fiscalYear periodNumber amount account { code description } } }
+        }
+      }`);
+      const nodes = data.accountBalances.edges.map((e: { node: Record<string, any> }) => e.node);
+      if (nodes.length === 0) break;
+      actualItems = actualItems.concat(nodes.filter((b: Record<string, any>) => b.fiscalYear === year));
+      if (nodes.reduce((m: number, b: Record<string, any>) => Math.min(m, b.fiscalYear ?? 9999), 9999) < year) break;
+      if (nodes.length < pageSize) break;
+    }
+    if (periodNumber) actualItems = actualItems.filter((b) => b.periodNumber === periodNumber);
+
+    // Aggregate budget by account
+    const budgetByAccount: Record<string, { description: string; budget: number }> = {};
+    for (const b of budgetItems) {
+      const key = b.account?.code || "?";
+      if (!budgetByAccount[key]) budgetByAccount[key] = { description: b.account?.description || "", budget: 0 };
+      budgetByAccount[key].budget += parseFloat(b.amount) || 0;
+    }
+
+    // Aggregate actual by account
+    const actualByAccount: Record<string, { description: string; actual: number }> = {};
+    for (const a of actualItems) {
+      const key = a.account?.code || "?";
+      if (!actualByAccount[key]) actualByAccount[key] = { description: a.account?.description || "", actual: 0 };
+      actualByAccount[key].actual += parseFloat(a.amount) || 0;
+    }
+
+    const allKeys = new Set([...Object.keys(budgetByAccount), ...Object.keys(actualByAccount)]);
+    const rows = Array.from(allKeys)
+      .map((code) => ({
+        accountCode: code,
+        description: budgetByAccount[code]?.description || actualByAccount[code]?.description || "",
+        budget: (budgetByAccount[code]?.budget || 0).toFixed(2),
+        actual: (actualByAccount[code]?.actual || 0).toFixed(2),
+        variance: ((actualByAccount[code]?.actual || 0) - (budgetByAccount[code]?.budget || 0)).toFixed(2),
+      }))
+      .sort((a, b) => a.accountCode.localeCompare(b.accountCode))
+      .slice(0, first);
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({ fiscalYear: year, periodNumber: periodNumber || "YTD", rows }, null, 2) }],
+    };
+  }
+);
+
+// ─── Tool: get_expenses ──────────────────────────────────────────────────────
+
+server.tool(
+  "get_expenses",
+  "Get employee expense report details from Xledger. Returns expense lines with amount, date, employee, expense type, project, and approval status. Use for cost analysis and T&E reporting.",
+  {
+    first: z
+      .number()
+      .optional()
+      .default(100)
+      .describe("Number of records to return (max 500)"),
+    fromDate: z.string().optional().describe("Filter from date (YYYY-MM-DD)"),
+    toDate: z.string().optional().describe("Filter to date (YYYY-MM-DD)"),
+    approvedOnly: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Only return approved expenses"),
+  },
+  { readOnlyHint: true, openWorldHint: true },
+  async ({ first, fromDate, toDate, approvedOnly }) => {
+    validateDate(fromDate, "fromDate");
+    validateDate(toDate, "toDate");
+
+    const filters: string[] = [];
+    if (fromDate) filters.push(`date_gte: "${fromDate}"`);
+    if (toDate) filters.push(`date_lte: "${toDate}"`);
+    if (approvedOnly) filters.push("approved: true");
+
+    const filterStr = filters.length > 0 ? `, filter: { ${filters.join(", ")} }` : "";
+
+    const data = await gql(`{
+      expenseDetails(first: ${Math.min(first, 500)}${filterStr}, orderBy: [{ field: MODIFIED_AT, direction: DESC }]) {
+        edges {
+          node {
+            dbId
+            date
+            amount
+            taxAmount
+            text
+            comment
+            billable
+            approved
+            approvedDate
+            employee { description email }
+            expenseType { description }
+            project { code description customer { description } }
+            currency { code }
+          }
+        }
+      }
+    }`);
+
+    const items = data.expenseDetails.edges.map((e: { node: unknown }) => e.node);
+    return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+  }
+);
+
+// ─── Tool: get_absences ──────────────────────────────────────────────────────
+
+server.tool(
+  "get_absences",
+  "Get employee absences from Xledger (sick leave, parental leave, VAB, vacation). Returns absence period, hours, employee, and absence code. Use for utilization analysis and capacity planning.",
+  {
+    first: z
+      .number()
+      .optional()
+      .default(100)
+      .describe("Number of records to return (max 500)"),
+    fromDate: z.string().optional().describe("Filter absences from date (YYYY-MM-DD)"),
+    toDate: z.string().optional().describe("Filter absences to date (YYYY-MM-DD)"),
+  },
+  { readOnlyHint: true, openWorldHint: true },
+  async ({ first, fromDate, toDate }) => {
+    validateDate(fromDate, "fromDate");
+    validateDate(toDate, "toDate");
+
+    const filters: string[] = [];
+    if (fromDate) filters.push(`fromDate_gte: "${fromDate}"`);
+    if (toDate) filters.push(`toDate_lte: "${toDate}"`);
+
+    const filterStr = filters.length > 0 ? `, filter: { ${filters.join(", ")} }` : "";
+
+    const data = await gql(`{
+      absences(first: ${Math.min(first, 500)}${filterStr}, orderBy: [{ field: MODIFIED_AT, direction: DESC }]) {
+        edges {
+          node {
+            dbId
+            fromDate
+            toDate
+            absenceHours
+            leavePercent
+            text
+            comment
+            approved
+            employee { description email }
+            absenceCode { description }
+          }
+        }
+      }
+    }`);
+
+    const items = data.absences.edges.map((e: { node: unknown }) => e.node);
+    return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+  }
+);
+
+// ─── Tool: get_exchange_rates ────────────────────────────────────────────────
+
+server.tool(
+  "get_exchange_rates",
+  "Get currency exchange rates from Xledger. Returns rate between currency pairs with valid date range. Use for FX exposure analysis and currency risk monitoring.",
+  {
+    first: z
+      .number()
+      .optional()
+      .default(50)
+      .describe("Number of records to return"),
+    fromCurrency: z
+      .string()
+      .optional()
+      .describe("Filter by source currency code (e.g. GBP, USD)"),
+    toCurrency: z
+      .string()
+      .optional()
+      .describe("Filter by target currency code (e.g. SEK)"),
+  },
+  { readOnlyHint: true, openWorldHint: true },
+  async ({ first, fromCurrency, toCurrency }) => {
+    const data = await gql(`{
+      exchangeRates(first: ${Math.min(first, 200)}, orderBy: [{ field: MODIFIED_AT, direction: DESC }]) {
+        edges {
+          node {
+            dbId
+            fromDate
+            toDate
+            exchangeRate
+            unitRate
+            currencyUnit
+            currencyFromCode
+            currencyToCode
+            currencyFrom { code }
+            currencyTo { code }
+          }
+        }
+      }
+    }`);
+
+    let items = data.exchangeRates.edges.map(
+      (e: { node: Record<string, any> }) => e.node
+    );
+
+    if (fromCurrency) {
+      const fc = fromCurrency.toUpperCase();
+      items = items.filter(
+        (r: Record<string, any>) =>
+          r.currencyFromCode?.toUpperCase() === fc || r.currencyFrom?.code?.toUpperCase() === fc
+      );
+    }
+    if (toCurrency) {
+      const tc = toCurrency.toUpperCase();
+      items = items.filter(
+        (r: Record<string, any>) =>
+          r.currencyToCode?.toUpperCase() === tc || r.currencyTo?.code?.toUpperCase() === tc
+      );
+    }
+
+    return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+  }
+);
+
+// ─── Tool: get_cash_transactions ─────────────────────────────────────────────
+
+server.tool(
+  "get_cash_transactions",
+  "Get cash book transactions from Xledger — actual bank transactions (debits/credits). Use for cash flow analysis and bank reconciliation. More granular than AR/AP — shows actual cash movement.",
+  {
+    first: z
+      .number()
+      .optional()
+      .default(100)
+      .describe("Number of records to return (max 500)"),
+    fromDate: z.string().optional().describe("Filter from date (YYYY-MM-DD)"),
+    toDate: z.string().optional().describe("Filter to date (YYYY-MM-DD)"),
+  },
+  { readOnlyHint: true, openWorldHint: true },
+  async ({ first, fromDate, toDate }) => {
+    validateDate(fromDate, "fromDate");
+    validateDate(toDate, "toDate");
+
+    const filters: string[] = [];
+    if (fromDate) filters.push(`createdAt_gte: "${fromDate}"`);
+    if (toDate) filters.push(`createdAt_lte: "${toDate}"`);
+
+    const filterStr = filters.length > 0 ? `, filter: { ${filters.join(", ")} }` : "";
+
+    const data = await gql(`{
+      cashBookTransactions(first: ${Math.min(first, 500)}${filterStr}, orderBy: [{ field: MODIFIED_AT, direction: DESC }]) {
+        edges {
+          node {
+            dbId
+            text
+            fiscalYear
+            paymentReference
+            bankAmount
+            debit_v2
+            credit_v2
+            postedBankDate
+            bankCode
+            bankAccount { description }
+            period { monthNumber fiscalYear }
+          }
+        }
+      }
+    }`);
+
+    const items = data.cashBookTransactions.edges.map((e: { node: unknown }) => e.node);
+    return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+  }
+);
+
+// ─── Tool: get_deltas ────────────────────────────────────────────────────────
+
+server.tool(
+  "get_deltas",
+  "Get change records (deltas) from Xledger for the last 3 days. Supports: arTransactions, timesheets, projects, apTransactions, employees, accounts. Use for incremental sync and change detection.",
+  {
+    entity: z
+      .enum(["arTransactions", "timesheets", "projects", "apTransactions", "employees", "accounts"])
+      .describe("Which entity to get deltas for"),
+    first: z
+      .number()
+      .optional()
+      .default(50)
+      .describe("Number of delta records to return (max 200)"),
+  },
+  { readOnlyHint: true, openWorldHint: true },
+  async ({ entity, first }) => {
+    const limit = Math.min(first, 200);
+    const queryMap: Record<string, string> = {
+      arTransactions: `arTransaction_deltas(first: ${limit}) {
+        edges { node { dbId invoiceNumber invoiceDate invoiceAmount invoiceRemaining subledger { description } } }
+      }`,
+      timesheets: `timesheet_deltas(first: ${limit}) {
+        edges { node { dbId assignmentDate workingHours invoiced approved employee { description } } }
+      }`,
+      projects: `project_deltas(first: ${limit}) {
+        edges { node { dbId code description billable totalRevenue totalCost customer { description } } }
+      }`,
+      apTransactions: `apTransaction_deltas(first: ${limit}) {
+        edges { node { dbId invoiceNumber invoiceDate invoiceAmount invoiceRemaining subledger { description } } }
+      }`,
+      employees: `employee_deltas(first: ${limit}) {
+        edges { node { dbId description email employmentFrom employmentTo } }
+      }`,
+      accounts: `account_deltas(first: ${limit}) {
+        edges { node { dbId code description } }
+      }`,
+    };
+
+    const data = await gql(`{ ${queryMap[entity]} }`);
+    const key = Object.keys(data)[0];
+    const items = data[key].edges.map((e: { node: unknown }) => e.node);
+
+    return {
+      content: [{ type: "text", text: JSON.stringify({ entity, count: items.length, deltas: items }, null, 2) }],
+    };
+  }
+);
+
 // ─── Start server ────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();
