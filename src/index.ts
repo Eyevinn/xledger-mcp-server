@@ -907,19 +907,19 @@ server.tool(
     validateDate(fromDate, "fromDate");
     validateDate(toDate, "toDate");
 
-    // Fetch all recent transactions and filter client-side by date.
-    // Note: cashBookTransactions filter does not support createdAt — using
-    // postedBankDate filter. If unavailable, fall back to client-side filtering.
+    // CashBookTransaction_Filter supports createdAt (DateTimeString: ISO 8601 with time).
+    // Convert YYYY-MM-DD date inputs to full DateTime strings for the API.
+    // postedBankDate is NOT a filter field — createdAt and modifiedAt are the only date filters.
     const filters: string[] = [];
-    if (fromDate) filters.push(`postedBankDate_gte: "${fromDate}"`);
-    if (toDate) filters.push(`postedBankDate_lte: "${toDate}"`);
+    if (fromDate) filters.push(`createdAt_gte: "${fromDate}T00:00:00Z"`);
+    if (toDate) filters.push(`createdAt_lte: "${toDate}T23:59:59Z"`);
 
     const filterStr = filters.length > 0 ? `, filter: { ${filters.join(", ")} }` : "";
 
     let items: unknown[];
     try {
       const data = await gql(`{
-        cashBookTransactions(first: ${Math.min(first, 500)}${filterStr}, orderBy: [{ field: POSTED_BANK_DATE, direction: DESC }]) {
+        cashBookTransactions(first: ${Math.min(first, 500)}${filterStr}, orderBy: [{ field: MODIFIED_AT, direction: DESC }]) {
           edges {
             node {
               dbId
@@ -940,9 +940,9 @@ server.tool(
 
       items = (data.cashBookTransactions?.edges ?? []).map((e: { node: unknown }) => e.node);
     } catch {
-      // If postedBankDate filter is not supported, fetch without filter and apply client-side
+      // Fallback: fetch without filter and apply client-side date filtering on postedBankDate
       const data = await gql(`{
-        cashBookTransactions(first: ${Math.min(first, 500)}, orderBy: [{ field: POSTED_BANK_DATE, direction: DESC }]) {
+        cashBookTransactions(first: ${Math.min(first, 500)}, orderBy: [{ field: MODIFIED_AT, direction: DESC }]) {
           edges {
             node {
               dbId
