@@ -188,48 +188,27 @@ server.tool(
   async ({ fiscalYear, periodNumber, first }) => {
     const year = fiscalYear || new Date().getFullYear();
 
-    // Paginate using offset (Xledger v2 doesn't expose endCursor)
-    const pageSize = 500;
-    let collected: Record<string, unknown>[] = [];
-    const maxPages = 6;
-
-    for (let page = 0; page < maxPages; page++) {
-      const offset = page * pageSize;
-      const offsetClause = offset > 0 ? `, offset: ${offset}` : "";
-      const data = await gql(`{
-        accountBalances(first: ${pageSize}${offsetClause}, orderBy: [{ field: PERIOD_ID, direction: DESC }]) {
-          edges {
-            node {
-              dbId
-              fiscalYear
-              periodNumber
-              amount
-              quantity
-              account { code description }
-              company { description }
-            }
+    // Fetch a large batch and filter client-side by fiscal year.
+    // Note: Xledger v2 does not support 'offset' on accountBalances.
+    const data = await gql(`{
+      accountBalances(first: 2000, orderBy: [{ field: PERIOD_ID, direction: DESC }]) {
+        edges {
+          node {
+            dbId
+            fiscalYear
+            periodNumber
+            amount
+            quantity
+            account { code description }
+            company { description }
           }
         }
-      }`);
+      }
+    }`);
 
-      const nodes = data.accountBalances.edges.map(
-        (e: { node: Record<string, any> }) => e.node
-      );
-
-      if (nodes.length === 0) break;
-
-      collected = collected.concat(
-        nodes.filter((b: Record<string, any>) => b.fiscalYear === year)
-      );
-
-      const minYear = nodes.reduce(
-        (m: number, b: Record<string, any>) =>
-          Math.min(m, b.fiscalYear ?? 9999),
-        9999
-      );
-      if (minYear < year) break;
-      if (nodes.length < pageSize) break;
-    }
+    let collected = (data.accountBalances?.edges ?? []).map(
+      (e: { node: Record<string, any> }) => e.node
+    ).filter((b: Record<string, any>) => b.fiscalYear === year);
 
     if (periodNumber) {
       collected = collected.filter(
@@ -693,23 +672,15 @@ server.tool(
       .filter((b: Record<string, any>) => b.fiscalYear === year);
     if (periodNumber) budgetItems = budgetItems.filter((b) => b.periodNumber === periodNumber);
 
-    // Actual balances — same pagination pattern as get_account_balances
-    const pageSize = 500;
-    let actualItems: Record<string, any>[] = [];
-    for (let page = 0; page < 6; page++) {
-      const offset = page * pageSize;
-      const offsetClause = offset > 0 ? `, offset: ${offset}` : "";
-      const data = await gql(`{
-        accountBalances(first: ${pageSize}${offsetClause}, orderBy: [{ field: PERIOD_ID, direction: DESC }]) {
-          edges { node { fiscalYear periodNumber amount account { code description } } }
-        }
-      }`);
-      const nodes = data.accountBalances.edges.map((e: { node: Record<string, any> }) => e.node);
-      if (nodes.length === 0) break;
-      actualItems = actualItems.concat(nodes.filter((b: Record<string, any>) => b.fiscalYear === year));
-      if (nodes.reduce((m: number, b: Record<string, any>) => Math.min(m, b.fiscalYear ?? 9999), 9999) < year) break;
-      if (nodes.length < pageSize) break;
-    }
+    // Actual balances — single fetch, filter client-side (no offset support in Xledger v2)
+    const actualData = await gql(`{
+      accountBalances(first: 2000, orderBy: [{ field: PERIOD_ID, direction: DESC }]) {
+        edges { node { fiscalYear periodNumber amount account { code description } } }
+      }
+    }`);
+    let actualItems: Record<string, any>[] = (actualData.accountBalances?.edges ?? [])
+      .map((e: { node: Record<string, any> }) => e.node)
+      .filter((b: Record<string, any>) => b.fiscalYear === year);
     if (periodNumber) actualItems = actualItems.filter((b) => b.periodNumber === periodNumber);
 
     // Aggregate budget by account
@@ -936,33 +907,76 @@ server.tool(
     validateDate(fromDate, "fromDate");
     validateDate(toDate, "toDate");
 
+    // Fetch all recent transactions and filter client-side by date.
+    // Note: cashBookTransactions filter does not support createdAt — using
+    // postedBankDate filter. If unavailable, fall back to client-side filtering.
     const filters: string[] = [];
-    if (fromDate) filters.push(`createdAt_gte: "${fromDate}"`);
-    if (toDate) filters.push(`createdAt_lte: "${toDate}"`);
+    if (fromDate) filters.push(`postedBankDate_gte: "${fromDate}"`);
+    if (toDate) filters.push(`postedBankDate_lte: "${toDate}"`);
 
     const filterStr = filters.length > 0 ? `, filter: { ${filters.join(", ")} }` : "";
 
-    const data = await gql(`{
-      cashBookTransactions(first: ${Math.min(first, 500)}${filterStr}, orderBy: [{ field: MODIFIED_AT, direction: DESC }]) {
-        edges {
-          node {
-            dbId
-            text
-            fiscalYear
-            paymentReference
-            bankAmount
-            debit_v2
-            credit_v2
-            postedBankDate
-            bankCode
-            bankAccount { description }
-            period { monthNumber fiscalYear }
+    let items: unknown[];
+    try {
+      const data = await gql(`{
+        cashBookTransactions(first: ${Math.min(first, 500)}${filterStr}, orderBy: [{ field: POSTED_BANK_DATE, direction: DESC }]) {
+          edges {
+            node {
+              dbId
+              text
+              fiscalYear
+              paymentReference
+              bankAmount
+              debit_v2
+              credit_v2
+              postedBankDate
+              bankCode
+              bankAccount { description }
+              period { monthNumber fiscalYear }
+            }
           }
         }
-      }
-    }`);
+      }`);
 
-    const items = data.cashBookTransactions.edges.map((e: { node: unknown }) => e.node);
+      items = (data.cashBookTransactions?.edges ?? []).map((e: { node: unknown }) => e.node);
+    } catch {
+      // If postedBankDate filter is not supported, fetch without filter and apply client-side
+      const data = await gql(`{
+        cashBookTransactions(first: ${Math.min(first, 500)}, orderBy: [{ field: POSTED_BANK_DATE, direction: DESC }]) {
+          edges {
+            node {
+              dbId
+              text
+              fiscalYear
+              paymentReference
+              bankAmount
+              debit_v2
+              credit_v2
+              postedBankDate
+              bankCode
+              bankAccount { description }
+              period { monthNumber fiscalYear }
+            }
+          }
+        }
+      }`);
+
+      items = (data.cashBookTransactions?.edges ?? []).map(
+        (e: { node: Record<string, any> }) => e.node
+      );
+
+      // Client-side date filtering as fallback
+      if (fromDate || toDate) {
+        items = items.filter((item: any) => {
+          const d = item.postedBankDate;
+          if (!d) return false;
+          if (fromDate && d < fromDate) return false;
+          if (toDate && d > toDate) return false;
+          return true;
+        });
+      }
+    }
+
     return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
   }
 );
