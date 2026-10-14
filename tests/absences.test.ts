@@ -2,8 +2,10 @@ import { describe, it, expect } from "vitest";
 import {
   aggregateAbsences,
   applyArt9Gate,
+  guardAbsenceRowsPayload,
   isAbsenceProject,
   isDisclosableAbsenceType,
+  redactAbsenceRows,
   type AbsenceAggregate,
 } from "../src/absences.js";
 
@@ -105,6 +107,30 @@ describe("absence classification", () => {
     }
   });
 
+  it("treats temporary parental benefit / care of a sick child as health, even though it says parental", () => {
+    for (const t of [
+      "Tillfällig föräldrapenning",
+      "Tillf. föräldraledighet",
+      "Temporary parental leave",
+      "Temporary parental benefit",
+      "Vård av barn",
+      "VAB-dag",
+      "Care of sick child",
+      "Care of a child",
+    ]) {
+      expect(isDisclosableAbsenceType(t)).toBe(false);
+    }
+  });
+
+  it("temporary parental leave is aggregated, not shown per person", () => {
+    const r = applyArt9Gate(
+      [mk("Person P", "Föräldraledig", 40), mk("Person Q", "Tillfällig föräldrapenning", 16)],
+      { env: {} }
+    );
+    expect(names(r)).toEqual(["Person P/Föräldraledig"]);
+    expect(r.healthRelatedAbsence?.totalHours).toBe(16);
+  });
+
   it("detects absence projects", () => {
     expect(isAbsenceProject("Frånvaro")).toBe(true);
     expect(isAbsenceProject("Absence")).toBe(true);
@@ -126,5 +152,86 @@ describe("aggregateAbsences", () => {
     expect(sem.days).toBe(2);
     expect(sem.firstDate).toBe("2026-03-01");
     expect(sem.lastDate).toBe("2026-03-02");
+  });
+});
+
+// Timesheet-shaped rows, as returned by get_timesheets.
+const ts = (employee: string, project: string, timeType: string, extra: Record<string, unknown> = {}) => ({
+  assignmentDate: "2026-03-02",
+  workingHours: "8",
+  text: `${project} note`,
+  comment: `${timeType} comment`,
+  employee: { description: employee, email: "x@example.com" },
+  project: { code: "P1", description: project, customer: { description: "Own company" }, billable: false },
+  timeType: { description: timeType },
+  ...extra,
+});
+
+describe("redactAbsenceRows (get_timesheets / get_expenses / get_journal_entries)", () => {
+  const rows = [
+    ts("Person A", "Customer project X", "Normal time"),
+    ts("Person B", "Frånvaro", "Sjukdag 2-14"),
+    ts("Person C", "Internal", "Tillfällig föräldrapenning"),
+  ];
+
+  it("default: absence rows lose project/time-type names and free text; others untouched", () => {
+    const r = redactAbsenceRows(rows, { env: {} });
+    expect(r.absenceRowsRedacted).toBe(2);
+    expect(r.items[0]).toEqual(rows[0]);
+    for (const row of r.items.slice(1)) {
+      expect(row.project.description).toBe("Absence");
+      expect(row.project.code).toBeNull();
+      expect(row.timeType.description).toBe("Absence");
+      expect(row).not.toHaveProperty("text");
+      expect(row).not.toHaveProperty("comment");
+      expect(row.workingHours).toBe("8");
+      expect(row.employee.description).toMatch(/Person/);
+    }
+    const out = JSON.stringify(r.items.slice(1));
+    expect(out).not.toMatch(/Sjuk|Frånvaro|Tillfällig|föräldra/i);
+    expect(r.healthDetailRefused).toBeUndefined();
+  });
+
+  it("does not mutate the input rows", () => {
+    redactAbsenceRows(rows, { env: {} });
+    expect(rows[1].project.description).toBe("Frånvaro");
+    expect(rows[1].text).toBe("Frånvaro note");
+  });
+
+  it("flag without env var: still redacted, refusal reported", () => {
+    const r = redactAbsenceRows(rows, { includeHealthDetail: true, env: {} });
+    expect(r.absenceRowsRedacted).toBe(2);
+    expect(typeof r.healthDetailRefused).toBe("string");
+  });
+
+  it("env var without flag: still redacted", () => {
+    const r = redactAbsenceRows(rows, { env: { XLEDGER_ALLOW_ART9_DETAIL: "1" } });
+    expect(r.absenceRowsRedacted).toBe(2);
+  });
+
+  it("flag AND env var: rows returned unchanged", () => {
+    const r = redactAbsenceRows(rows, {
+      includeHealthDetail: true,
+      env: { XLEDGER_ALLOW_ART9_DETAIL: "1" },
+    });
+    expect(r.absenceRowsRedacted).toBe(0);
+    expect(r.items).toEqual(rows);
+    expect(r.healthDetailRefused).toBeUndefined();
+  });
+
+  it("journal-entry shape: only the listed text fields are dropped", () => {
+    const je = { text: "Sjuklön", amount: "100", project: { code: "9", description: "Sjukfrånvaro" } };
+    const r = redactAbsenceRows([je], { env: {}, textFields: ["text"] });
+    expect(r.items[0]).toEqual({ amount: "100", project: { code: null, description: "Absence" } });
+  });
+
+  it("payload: plain array when nothing is redacted, wrapped with a note otherwise", () => {
+    expect(guardAbsenceRowsPayload([rows[0]], { env: {} })).toEqual([rows[0]]);
+    const p = guardAbsenceRowsPayload(rows, { env: {} }) as Record<string, any>;
+    expect(p.absenceRowsRedacted).toBe(2);
+    expect(typeof p.note).toBe("string");
+    expect(p.items).toHaveLength(3);
+    const refused = guardAbsenceRowsPayload([rows[0]], { includeHealthDetail: true, env: {} }) as Record<string, any>;
+    expect(typeof refused.healthDetailRefused).toBe("string");
   });
 });

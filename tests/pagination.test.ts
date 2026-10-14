@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { connNodes, paginateAll } from "../src/pagination.js";
+import { connNodes, paginateAll, truncationWarning } from "../src/pagination.js";
 
 describe("connNodes", () => {
   it("handles null edges (Xledger's empty result)", () => {
@@ -28,6 +28,7 @@ describe("paginateAll", () => {
       .mockResolvedValueOnce(page([3], false));
     const nodes = await paginateAll(run, (after) => `{ things(first: 2${after}) }`, (d) => d.things);
     expect(nodes.map((n) => n.id)).toEqual([1, 2, 3]);
+    expect(nodes.truncated).toBe(false);
     expect(run).toHaveBeenNthCalledWith(1, "{ things(first: 2) }");
     expect(run).toHaveBeenNthCalledWith(2, '{ things(first: 2, after: "c2") }');
   });
@@ -42,17 +43,44 @@ describe("paginateAll", () => {
       stopWhen: (p) => Math.max(...p.map((n) => n.fiscalYear)) < 2025,
     });
     expect(nodes.map((n) => n.id)).toEqual([1, 2]);
+    expect(nodes.truncated).toBe(false);
     expect(run).toHaveBeenCalledTimes(2);
   });
 
-  it("respects maxPages", async () => {
+  it("respects maxPages and flags the result as truncated", async () => {
     const run = vi.fn().mockResolvedValue(page([1], true));
-    await paginateAll(run, (a) => a, (d) => d.things, { maxPages: 3 });
+    const nodes = await paginateAll(run, (a) => a, (d) => d.things, { maxPages: 3 });
     expect(run).toHaveBeenCalledTimes(3);
+    expect(nodes).toHaveLength(3);
+    expect(nodes.truncated).toBe(true);
+  });
+
+  it("is not truncated when the last allowed page is also the last page", async () => {
+    const run = vi
+      .fn()
+      .mockResolvedValueOnce(page([1], true))
+      .mockResolvedValueOnce(page([2], false));
+    const nodes = await paginateAll(run, (a) => a, (d) => d.things, { maxPages: 2 });
+    expect(nodes.truncated).toBe(false);
+  });
+
+  it("flags truncation when hasNextPage is set but no cursor is returned", async () => {
+    const run = vi.fn().mockResolvedValue({
+      things: { pageInfo: { hasNextPage: true }, edges: [{ node: { id: 1 } }] },
+    });
+    const nodes = await paginateAll(run, (a) => a, (d) => d.things);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(nodes.truncated).toBe(true);
+  });
+
+  it("truncationWarning names the source", () => {
+    expect(truncationWarning("salesOrders")).toMatch(/^salesOrders: .*incomplete/);
   });
 
   it("survives a null connection", async () => {
     const run = vi.fn().mockResolvedValue({ things: { edges: null } });
-    expect(await paginateAll(run, (a) => a, (d) => d.things)).toEqual([]);
+    const nodes = await paginateAll(run, (a) => a, (d) => d.things);
+    expect(nodes).toEqual([]);
+    expect(nodes.truncated).toBe(false);
   });
 });

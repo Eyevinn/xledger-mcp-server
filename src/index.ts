@@ -20,15 +20,19 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { gql } from "./graphql.js";
 import { validateDate, today, monthChunks, monthSpan } from "./validation.js";
-import { connNodes, paginateAll, type Node } from "./pagination.js";
+import { connNodes, paginateAll, truncationWarning, type Node } from "./pagination.js";
 import {
   ABSENCE_RE,
   ART9_ENV_VAR,
+  INCLUDE_HEALTH_DETAIL_DESCRIPTION,
   aggregateAbsences,
   applyArt9Gate,
-  isAbsenceProject,
+  art9DetailAllowed,
+  art9Refusal,
+  guardAbsenceRowsPayload,
   type AbsenceRow,
 } from "./absences.js";
+import { aggregateConsultants } from "./profitability.js";
 
 const VERSION = "1.1.0";
 
@@ -45,6 +49,23 @@ function json(value: unknown) {
 
 function filterClause(filters: string[]): string {
   return filters.length > 0 ? `, filter: { ${filters.join(", ")} }` : "";
+}
+
+// Wrap an array result with a warning when pagination was cut short. The shape
+// only changes when there is something to warn about.
+function withTruncation(items: unknown[], truncated: boolean, what: string) {
+  return truncated ? json({ warning: truncationWarning(what), truncated: true, items }) : json(items);
+}
+
+const includeHealthDetailParam = z
+  .boolean()
+  .optional()
+  .default(false)
+  .describe(INCLUDE_HEALTH_DETAIL_DESCRIPTION);
+
+// Per-person row lists that can contain absence rows go through this guard.
+function guardedRows(rows: Node[], includeHealthDetail: boolean, textFields?: string[]) {
+  return json(guardAbsenceRowsPayload(rows, { includeHealthDetail, textFields }));
 }
 
 // Timesheet rows per month are fetched with first: 500. If a month hits the
@@ -188,7 +209,7 @@ server.tool(
     let collected = nodes.filter((b) => b.fiscalYear === year);
     if (periodNumber) collected = collected.filter((b) => b.periodNumber === periodNumber);
 
-    return json(collected.slice(0, Math.min(first, 500)));
+    return withTruncation(collected.slice(0, Math.min(first, 500)), nodes.truncated, "accountBalances");
   }
 );
 
@@ -247,7 +268,7 @@ server.tool(
 
 server.tool(
   "get_timesheets",
-  "Get timesheet entries from Xledger. Returns hours worked per employee per project with invoice status, hourly cost rate (hourlyCost), and hourly revenue rate (hourlyRevenueCurrency). Use for utilization analysis, billing verification, and profitability analysis.",
+  `Get timesheet entries from Xledger. Returns hours worked per employee per project with invoice status, hourly cost rate (hourlyCost), and hourly revenue rate (hourlyRevenueCurrency). Use for utilization analysis, billing verification, and profitability analysis. GDPR Art. 9: rows booked to absence projects or absence time types are returned with project and time type shown as "Absence" and without text/comment, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment.`,
   {
     first: z.number().optional().default(100).describe("Number of records to return (max 500)"),
     fromDate: z.string().optional().describe("Filter from date (YYYY-MM-DD)"),
@@ -258,9 +279,10 @@ server.tool(
       .optional()
       .default(false)
       .describe("Only return not-yet-invoiced timesheets"),
+    includeHealthDetail: includeHealthDetailParam,
   },
   READ_ONLY,
-  async ({ first, fromDate, toDate, invoicedOnly, notInvoiced }) => {
+  async ({ first, fromDate, toDate, invoicedOnly, notInvoiced, includeHealthDetail }) => {
     validateDate(fromDate, "fromDate");
     validateDate(toDate, "toDate");
 
@@ -292,7 +314,7 @@ server.tool(
       }
     }`);
 
-    return json(connNodes(data.timesheets));
+    return guardedRows(connNodes(data.timesheets), includeHealthDetail);
   }
 );
 
@@ -300,7 +322,7 @@ server.tool(
 
 server.tool(
   "get_consultant_profitability",
-  "Get consultant profitability analysis from Xledger timesheets. Calculates utilization (billable hours / total hours excluding absence), cost from a monthly salary plus employer social security contributions, and revenue from a provided hourly rate. Returns a per-consultant and per-project breakdown with contribution margin and utilization rate. Salary and hourly rate are inputs because payroll data is usually outside the API token's scope. Amounts are in the company's base currency.",
+  `Get consultant profitability analysis from Xledger timesheets. Calculates utilization (billable hours / total hours excluding absence), cost from a monthly salary plus employer social security contributions, and revenue from a provided hourly rate. Returns a per-consultant and per-project breakdown with contribution margin and utilization rate. Absence hours are reported only as hours.absence; absence projects are not listed in the per-consultant project breakdown (GDPR Art. 9) unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment. Salary and hourly rate are inputs because payroll data is usually outside the API token's scope. Amounts are in the company's base currency.`,
   {
     fromDate: z.string().describe("Period start date (YYYY-MM-DD)"),
     toDate: z.string().describe("Period end date (YYYY-MM-DD)"),
@@ -321,9 +343,10 @@ server.tool(
       .optional()
       .default(31.42)
       .describe("Employer social security contribution in percent of salary. Default 31.42 (Swedish standard rate)."),
+    includeHealthDetail: includeHealthDetailParam,
   },
   READ_ONLY,
-  async ({ fromDate, toDate, employeeName, monthlySalary, hourlyRate, agAvgPct }) => {
+  async ({ fromDate, toDate, employeeName, monthlySalary, hourlyRate, agAvgPct, includeHealthDetail }) => {
     validateDate(fromDate, "fromDate");
     validateDate(toDate, "toDate");
 
@@ -360,116 +383,26 @@ server.tool(
         )
       : allEntries;
 
-    const periodMonths = monthSpan(fromDate, toDate);
-    const contributionPct = agAvgPct ?? 31.42;
-    const monthlyCost = monthlySalary ? monthlySalary * (1 + contributionPct / 100) : null;
-    const totalCostForPeriod = monthlyCost ? monthlyCost * periodMonths : null;
-
-    type ProjAgg = { customer: string; billable: boolean; hours: number; invoiceHours: number };
-    type EmpAgg = {
-      email: string;
-      totalHours: number;
-      billableHours: number;
-      nonBillableHours: number;
-      absenceHours: number;
-      projects: Record<string, ProjAgg>;
-    };
-    const byEmployee: Record<string, EmpAgg> = {};
-
-    for (const entry of filtered) {
-      const name = entry.employee?.description || "Unknown";
-      if (!byEmployee[name]) {
-        byEmployee[name] = {
-          email: entry.employee?.email || "",
-          totalHours: 0,
-          billableHours: 0,
-          nonBillableHours: 0,
-          absenceHours: 0,
-          projects: {},
-        };
-      }
-      const emp = byEmployee[name];
-      const hours = parseFloat(entry.workingHours || "0");
-      const invHours = parseFloat(entry.invoiceHours || "0");
-      const isAbsence = isAbsenceProject(entry.project?.description);
-      const isBillable = entry.project?.billable === true;
-
-      emp.totalHours += hours;
-      if (isAbsence) emp.absenceHours += hours;
-      else if (isBillable) emp.billableHours += hours;
-      else emp.nonBillableHours += hours;
-
-      const projKey = entry.project?.description || "Unknown";
-      if (!emp.projects[projKey]) {
-        emp.projects[projKey] = {
-          customer: entry.project?.customer?.description || "-",
-          billable: isBillable,
-          hours: 0,
-          invoiceHours: 0,
-        };
-      }
-      emp.projects[projKey].hours += hours;
-      emp.projects[projKey].invoiceHours += invHours;
-    }
-
-    const round1 = (n: number) => Math.round(n * 10) / 10;
-
-    const consultants = Object.entries(byEmployee)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([name, d]) => {
-        const base = d.totalHours - d.absenceHours;
-        const utilizationRate = base > 0 ? Math.round((d.billableHours / base) * 1000) / 10 : 0;
-        const totalRevenue = hourlyRate ? Math.round(d.billableHours * hourlyRate) : null;
-        const totalCost = totalCostForPeriod;
-        const margin = totalRevenue !== null && totalCost !== null ? totalRevenue - totalCost : null;
-        const marginPct =
-          margin !== null && totalRevenue ? Math.round((margin / totalRevenue) * 1000) / 10 : null;
-        const breakevenRate =
-          totalCost !== null && d.billableHours > 0 ? Math.round(totalCost / d.billableHours) : null;
-
-        return {
-          employee: name,
-          email: d.email,
-          period: { from: fromDate, to: toDate, months: periodMonths },
-          assumptions: {
-            monthlySalary: monthlySalary ?? null,
-            agAvgPct: contributionPct,
-            monthlyCostWithContributions: monthlyCost ? Math.round(monthlyCost) : null,
-            hourlyRate: hourlyRate ?? null,
-          },
-          hours: {
-            total: round1(d.totalHours),
-            billable: round1(d.billableHours),
-            nonBillable: round1(d.nonBillableHours),
-            absence: round1(d.absenceHours),
-            utilizationRate: `${utilizationRate}%`,
-          },
-          financials: {
-            totalCost,
-            totalRevenue,
-            margin,
-            marginPct: marginPct !== null ? `${marginPct}%` : null,
-            breakevenHourlyRate: breakevenRate,
-          },
-          projects: Object.entries(d.projects)
-            .sort(([, a], [, b]) => b.hours - a.hours)
-            .map(([proj, pd]) => ({
-              project: proj,
-              customer: pd.customer,
-              billable: pd.billable,
-              hours: round1(pd.hours),
-              revenue: hourlyRate && pd.billable ? Math.round(pd.invoiceHours * hourlyRate) : null,
-            })),
-        };
-      });
+    const consultants = aggregateConsultants(filtered, {
+      fromDate,
+      toDate,
+      periodMonths: monthSpan(fromDate, toDate),
+      monthlySalary,
+      hourlyRate,
+      agAvgPct,
+      allowAbsenceDetail: art9DetailAllowed(includeHealthDetail),
+    });
+    const healthDetailRefused = art9Refusal(includeHealthDetail);
 
     if (truncatedMonths.length > 0) {
       return json({
         warning: `Timesheet rows hit the ${TIMESHEET_PAGE}-row limit in ${truncatedMonths.join(", ")}. Hours for those months are incomplete; narrow the date range or filter by employee.`,
         truncatedMonths,
+        ...(healthDetailRefused ? { healthDetailRefused } : {}),
         consultants,
       });
     }
+    if (healthDetailRefused) return json({ healthDetailRefused, consultants });
     return json(consultants);
   }
 );
@@ -479,15 +412,16 @@ server.tool(
 
 server.tool(
   "get_journal_entries",
-  "Get journal entries (raw GL transactions) from Xledger. Returns detailed accounting entries with account, amount, date, project. Use for detailed financial analysis.",
+  `Get journal entries (raw GL transactions) from Xledger. Returns detailed accounting entries with account, amount, date, project. Use for detailed financial analysis. GDPR Art. 9: entries booked to absence projects are returned with the project shown as "Absence" and without text, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment.`,
   {
     first: z.number().optional().default(50).describe("Number of records to return (max 200)"),
     fromDate: z.string().optional().describe("Created date from (YYYY-MM-DD); postedDate is not filterable"),
     toDate: z.string().optional().describe("Created date to (YYYY-MM-DD); postedDate is not filterable"),
     fiscalYear: z.number().optional().describe("Filter by fiscal year (client-side)"),
+    includeHealthDetail: includeHealthDetailParam,
   },
   READ_ONLY,
-  async ({ first, fromDate, toDate, fiscalYear }) => {
+  async ({ first, fromDate, toDate, fiscalYear, includeHealthDetail }) => {
     validateDate(fromDate, "fromDate");
     validateDate(toDate, "toDate");
 
@@ -529,7 +463,7 @@ server.tool(
     let items = connNodes(conn);
     if (fiscalYear) items = items.filter((e) => e.fiscalYear === fiscalYear);
 
-    return json(items);
+    return guardedRows(items, includeHealthDetail, ["text"]);
   }
 );
 
@@ -591,7 +525,7 @@ server.tool(
   },
   READ_ONLY,
   async ({ first, search }) => {
-    let items = await paginateAll(
+    const all = await paginateAll(
       gql,
       (afterClause) => `{
         customers(first: 500${afterClause}, orderBy: [{ field: CREATED_AT, direction: DESC }]) {
@@ -609,6 +543,7 @@ server.tool(
       (d) => d.customers
     );
 
+    let items: Node[] = all;
     const totalCustomers = items.length;
     if (search) {
       const term = search.toLowerCase();
@@ -619,7 +554,13 @@ server.tool(
     const matched = items.length;
     items = items.slice(0, first);
 
-    return json({ totalCustomers, matched, returned: items.length, customers: items });
+    return json({
+      ...(all.truncated ? { warning: truncationWarning("customers"), truncated: true } : {}),
+      totalCustomers,
+      matched,
+      returned: items.length,
+      customers: items,
+    });
   }
 );
 
@@ -766,7 +707,18 @@ server.tool(
       .sort((a, b) => a.accountCode.localeCompare(b.accountCode))
       .slice(0, first);
 
-    return json({ fiscalYear: year, periodNumber: periodNumber || "all", rows });
+    const truncatedSources = [
+      ...(budgetNodes.truncated ? ["budgetBalances"] : []),
+      ...(actualNodes.truncated ? ["accountBalances"] : []),
+    ];
+    return json({
+      ...(truncatedSources.length > 0
+        ? { warning: truncationWarning(truncatedSources.join(" and ")), truncated: true }
+        : {}),
+      fiscalYear: year,
+      periodNumber: periodNumber || "all",
+      rows,
+    });
   }
 );
 
@@ -777,15 +729,16 @@ const EXPENSE_SCOPE_NOTE =
 
 server.tool(
   "get_expenses",
-  "Get employee expense lines from Xledger. Returns expense lines with amount, date, employee, expense type, project, and approval status. Use for cost analysis and travel & expense reporting. Results depend on the API token's Expense owner-scope.",
+  `Get employee expense lines from Xledger. Returns expense lines with amount, date, employee, expense type, project, and approval status. Use for cost analysis and travel & expense reporting. Results depend on the API token's Expense owner-scope. GDPR Art. 9: lines booked to absence projects are returned with the project shown as "Absence" and without text/comment, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment.`,
   {
     first: z.number().optional().default(100).describe("Number of records to return (max 500)"),
     fromDate: z.string().optional().describe("Filter from date (YYYY-MM-DD)"),
     toDate: z.string().optional().describe("Filter to date (YYYY-MM-DD)"),
     approvedOnly: z.boolean().optional().default(false).describe("Only return approved expenses"),
+    includeHealthDetail: includeHealthDetailParam,
   },
   READ_ONLY,
-  async ({ first, fromDate, toDate, approvedOnly }) => {
+  async ({ first, fromDate, toDate, approvedOnly, includeHealthDetail }) => {
     validateDate(fromDate, "fromDate");
     validateDate(toDate, "toDate");
 
@@ -820,7 +773,7 @@ server.tool(
     if (!conn || conn.edges == null) {
       return json({ items: [], note: `No expense lines returned. ${EXPENSE_SCOPE_NOTE}` });
     }
-    return json(connNodes(conn));
+    return guardedRows(connNodes(conn), includeHealthDetail);
   }
 );
 
@@ -895,13 +848,7 @@ server.tool(
       .optional()
       .describe("Filter absences from date (YYYY-MM-DD). Defaults to 1 January of the current year."),
     toDate: z.string().optional().describe("Filter absences to date (YYYY-MM-DD). Defaults to today."),
-    includeHealthDetail: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe(
-        `Leave unset. Per-person health absence is special-category personal data (GDPR Art. 9). It is returned only if this flag is set AND the server was started with ${ART9_ENV_VAR}=1 by the data controller; otherwise the request is refused.`
-      ),
+    includeHealthDetail: includeHealthDetailParam,
   },
   READ_ONLY,
   async ({ first, fromDate, toDate, includeHealthDetail }) => {
@@ -1179,7 +1126,7 @@ function isUninvoiced(node: Node): boolean {
   return !node.invoiceNumber || node.invoiceNumber === "0";
 }
 
-async function fetchSalesOrders(filters: string[]): Promise<Node[]> {
+async function fetchSalesOrders(filters: string[]) {
   return paginateAll(
     gql,
     (afterClause) => `{
@@ -1233,7 +1180,7 @@ server.tool(
     }
 
     const nodes = await fetchSalesOrders(filters);
-    return json(nodes.filter(isUninvoiced).slice(0, first));
+    return withTruncation(nodes.filter(isUninvoiced).slice(0, first), nodes.truncated, "salesOrders");
   }
 );
 
@@ -1256,7 +1203,11 @@ server.tool(
       `invoiceDate_gte: "${fromDate}"`,
       `invoiceDate_lte: "${toDate}"`,
     ]);
-    return json(nodes.filter((n) => !isUninvoiced(n)).slice(0, first));
+    return withTruncation(
+      nodes.filter((n) => !isUninvoiced(n)).slice(0, first),
+      nodes.truncated,
+      "salesOrders"
+    );
   }
 );
 

@@ -17,9 +17,14 @@
 export const ABSENCE_RE =
   /frånvaro|semester|sjuk|föräldra|vab|tjänstled|permission|absence|vacation|holiday|sick|parental/i;
 
-/** Absence types that reveal health information (own or a child's). */
+/**
+ * Absence types that reveal health information (own or a child's). Checked
+ * before NON_HEALTH_RE, so health wins: temporary parental benefit/leave
+ * ("Tillfällig föräldrapenning", "Temporary parental leave") is care of a sick
+ * child and must not be disclosed via the parental-leave match.
+ */
 export const HEALTH_RE =
-  /sjuk|karens|\bvab\b|graviditet|smittbärar|sick|illness|medical|pregnan|child care|childcare/i;
+  /sjuk|karens|\bvab\b|vård av barn|tillf|graviditet|smittbärar|sick|illness|medical|pregnan|child care|childcare|care of (a )?(sick )?child|temporary/i;
 
 /** Absence types positively recognised as non-health. */
 export const NON_HEALTH_RE =
@@ -27,6 +32,14 @@ export const NON_HEALTH_RE =
 
 export function isAbsenceProject(projectDescription: string | undefined): boolean {
   return ABSENCE_RE.test(projectDescription || "");
+}
+
+/** A timesheet-like row is absence if its project or its time type is. */
+export function isAbsenceRow(row: {
+  project?: { description?: string } | null;
+  timeType?: { description?: string } | null;
+}): boolean {
+  return isAbsenceProject(row.project?.description) || isAbsenceProject(row.timeType?.description);
 }
 
 /** True only for types that may be shown per named employee. */
@@ -81,6 +94,68 @@ export function aggregateAbsences(rows: AbsenceRow[]): AbsenceAggregate[] {
 
 export const ART9_ENV_VAR = "XLEDGER_ALLOW_ART9_DETAIL";
 
+/** Label that replaces absence project and time-type names in per-person rows. */
+export const ABSENCE_LABEL = "Absence";
+
+type Env = Record<string, string | undefined>;
+
+/**
+ * The two-key gate: per-person absence detail is allowed only when the caller
+ * sets includeHealthDetail AND the operator set XLEDGER_ALLOW_ART9_DETAIL=1.
+ */
+export function art9DetailAllowed(includeHealthDetail: boolean | undefined, env: Env = process.env): boolean {
+  return includeHealthDetail === true && env[ART9_ENV_VAR] === "1";
+}
+
+/** Refusal message when the caller asked for detail but the operator did not allow it. */
+export function art9Refusal(includeHealthDetail: boolean | undefined, env: Env = process.env): string | undefined {
+  if (includeHealthDetail === true && !art9DetailAllowed(includeHealthDetail, env)) {
+    return `includeHealthDetail was set but ${ART9_ENV_VAR} is not 1 in the server environment. Per-person health absence detail is withheld. Enabling it is a decision for the data controller, not for the calling assistant.`;
+  }
+  return undefined;
+}
+
+/** Shared parameter description for includeHealthDetail on every guarded tool. */
+export const INCLUDE_HEALTH_DETAIL_DESCRIPTION = `Leave unset. Per-person health absence is special-category personal data (GDPR Art. 9). It is returned only if this flag is set AND the server was started with ${ART9_ENV_VAR}=1 by the data controller; otherwise the request is refused.`;
+
+export interface RedactionResult<T> {
+  items: T[];
+  absenceRowsRedacted: number;
+  healthDetailRefused?: string;
+}
+
+/**
+ * Redact absence rows in per-person row lists (timesheets, expense lines,
+ * journal entries). Rows whose project or time type is an absence get their
+ * project/time-type names replaced with "Absence" and lose free-text fields,
+ * which could otherwise name the absence reason. Hours, dates and the employee
+ * stay, so totals still add up. Unless the two-key gate is satisfied.
+ */
+export function redactAbsenceRows<T extends Record<string, any>>(
+  rows: T[],
+  {
+    includeHealthDetail = false,
+    env = process.env,
+    textFields = ["text", "comment"],
+  }: { includeHealthDetail?: boolean; env?: Env; textFields?: string[] } = {}
+): RedactionResult<T> {
+  const healthDetailRefused = art9Refusal(includeHealthDetail, env);
+  if (art9DetailAllowed(includeHealthDetail, env)) {
+    return { items: rows, absenceRowsRedacted: 0 };
+  }
+  let absenceRowsRedacted = 0;
+  const items = rows.map((row) => {
+    if (!isAbsenceRow(row)) return row;
+    absenceRowsRedacted++;
+    const out: Record<string, any> = { ...row };
+    if (out.project) out.project = { ...out.project, code: null, description: ABSENCE_LABEL };
+    if (out.timeType) out.timeType = { ...out.timeType, description: ABSENCE_LABEL };
+    for (const f of textFields) delete out[f];
+    return out as T;
+  });
+  return { items, absenceRowsRedacted, ...(healthDetailRefused ? { healthDetailRefused } : {}) };
+}
+
 export interface Art9GateResult {
   byEmployeeAndType: AbsenceAggregate[];
   healthRelatedAbsence?: {
@@ -89,6 +164,29 @@ export interface Art9GateResult {
     note: string;
   };
   healthDetailRefused?: string;
+}
+
+export const ABSENCE_REDACTION_NOTE =
+  'GDPR Art. 9: rows booked to absence projects or absence time types have project and time-type names replaced with "Absence" and free-text fields removed, because the absence reason tied to a named person can be health data. Hours and dates are unchanged. Use get_absences for the guarded per-type breakdown.';
+
+/**
+ * Tool payload for a guarded row list: the plain array when nothing was
+ * redacted or refused, otherwise { absenceRowsRedacted, note,
+ * healthDetailRefused?, items }.
+ */
+export function guardAbsenceRowsPayload<T extends Record<string, any>>(
+  rows: T[],
+  opts: { includeHealthDetail?: boolean; env?: Env; textFields?: string[] } = {}
+): T[] | Record<string, unknown> {
+  const r = redactAbsenceRows(rows, opts);
+  if (r.absenceRowsRedacted === 0 && !r.healthDetailRefused) return r.items;
+  return {
+    ...(r.absenceRowsRedacted > 0
+      ? { absenceRowsRedacted: r.absenceRowsRedacted, note: ABSENCE_REDACTION_NOTE }
+      : {}),
+    ...(r.healthDetailRefused ? { healthDetailRefused: r.healthDetailRefused } : {}),
+    items: r.items,
+  };
 }
 
 /**
@@ -105,10 +203,10 @@ export function applyArt9Gate(
   }: {
     includeHealthDetail?: boolean;
     first?: number;
-    env?: Record<string, string | undefined>;
+    env?: Env;
   } = {}
 ): Art9GateResult {
-  const allowDetail = includeHealthDetail === true && env[ART9_ENV_VAR] === "1";
+  const allowDetail = art9DetailAllowed(includeHealthDetail, env);
 
   const disclosable = aggregates.filter((a) => isDisclosableAbsenceType(a.absenceType));
   const restricted = aggregates.filter((a) => !isDisclosableAbsenceType(a.absenceType));
@@ -129,9 +227,8 @@ export function applyArt9Gate(
     };
   }
 
-  if (includeHealthDetail === true && !allowDetail) {
-    result.healthDetailRefused = `includeHealthDetail was set but ${ART9_ENV_VAR} is not 1 in the server environment. Per-person health absence detail is withheld. Enabling it is a decision for the data controller, not for the calling assistant.`;
-  }
+  const refused = art9Refusal(includeHealthDetail, env);
+  if (refused) result.healthDetailRefused = refused;
 
   return result;
 }
