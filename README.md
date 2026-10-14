@@ -9,7 +9,7 @@ Use it with Claude, VS Code Copilot, or any MCP-compatible AI assistant to query
 - 19 read-only tools covering accounting, project, invoicing and HR data
 - Compatible with Xledger GraphQL API v2 (cursor pagination, v2 filter syntax)
 - Token-based authentication (no OAuth complexity)
-- GDPR Art. 9 guard on absence data in every tool that returns per-person rows (`get_absences`, `get_timesheets`, `get_consultant_profitability`, `get_expenses`, `get_journal_entries`): no per-person health absence by default
+- GDPR Art. 9 guard on absence project and time-type names in `get_absences`, `get_timesheets`, `get_consultant_profitability`, `get_expenses` and `get_journal_entries`: no per-person health absence by default. Some fields are not covered; see [Not covered](#not-covered)
 - Zero runtime dependencies beyond the MCP SDK
 - TypeScript with full type safety
 
@@ -135,7 +135,7 @@ printf '%s\n' \
 
 ## GDPR and absence data
 
-Absence is booked as timesheet rows on absence projects. An absence type tied to a named person can reveal health information (sick leave, care of a sick child). That is special-category personal data under GDPR Art. 9, and every tool result is sent to the AI model provider your MCP client uses.
+Absence is booked as timesheet rows on absence projects or absence time types. An absence type tied to a named person can reveal health information (sick leave, care of a sick child). That is special-category personal data under GDPR Art. 9, and every tool result is sent to the AI model provider your MCP client uses.
 
 The server therefore enforces the following before any data leaves it, instead of relying on an instruction to the assistant.
 
@@ -147,15 +147,26 @@ The server therefore enforces the following before any data leaves it, instead o
 
 ### Other tools that return per-person rows
 
-- **`get_timesheets`, `get_expenses`, `get_journal_entries`:** rows booked to an absence project (or, for timesheets, an absence time type) keep their hours, amounts, dates and employee, but the project name and code and the time-type name are replaced with `Absence`, and free-text fields (`text`, `comment`) are removed. The response then carries `absenceRowsRedacted` and a `note`. All absence rows are redacted this way, not only health-related ones, so the guard fails closed.
-- **`get_consultant_profitability`:** absence hours count only into `hours.absence` (and are excluded from the utilization base). Absence projects never appear in the per-consultant `projects` breakdown.
+- **`get_timesheets`, `get_expenses`, `get_journal_entries`:** a row is redacted when its project name (or, for timesheets, its time-type name) matches any absence, health-related or non-health absence term. It keeps its hours, amounts, dates and employee, but the project name and code and the time-type name are replaced, and free-text fields (`text`, `comment`) are removed. The response then carries `absenceRowsRedacted` and a `note`. All absence rows are redacted this way, not only health-related ones, so the guard fails closed.
+- **Two predicates.** Counting and redaction use different rules on purpose. A row is *counted* as absence (in `get_absences`, `hours.absence` and the `Absence` label) when its project **or** time type matches an explicit absence term, the same rule in every tool. *Redaction* is broader and errs on the safe side: it also matches stems such as `medical`, `temporary` or `tillf`, so a customer project like `Medical imaging` is redacted, labelled `Redacted` instead of `Absence`, and still counted as ordinary work.
+- **`get_consultant_profitability`:** absence hours count only into `hours.absence` (and are excluded from the utilization base). Absence projects never appear in the per-consultant `projects` breakdown. Other projects that the redaction rule matches are listed as `Redacted (billable)` / `Redacted (non-billable)`.
 - `get_projects`, `get_employees`, `get_expense_reports` and `get_deltas` return no project or time-type names alongside a person (the `timesheets` delta returns employee, date and hours only) and are not filtered.
 
 ### Override (all guarded tools)
 
 Per-person detail is returned only when the caller sets `includeHealthDetail: true` **and** the server was started with `XLEDGER_ALLOW_ART9_DETAIL=1`. Either one alone is refused, and the response says so (`healthDetailRefused`). The environment variable is a decision for the data controller, made with a documented lawful basis; the assistant cannot set it.
 
-Absence projects and types are matched on common Swedish and English names (for example `Frånvaro`/`Absence`, `Semester`/`Vacation`, `Sjuk`/`Sick`, `VAB`, `Föräldraledig`/`Parental leave`). See `src/absences.ts` if your Xledger setup uses other names.
+Absence projects and types are matched on common Swedish and English names (for example `Frånvaro`/`Absence`, `Semester`/`Vacation`, `Sjuk`/`Sick`, `Karens`, `VAB`/`Vård av barn`, `Läkarbesök`, `Föräldraledig`/`Parental leave`, `Leave`). Names outside these lists are not recognised as absence. See `src/absences.ts` if your Xledger setup uses other names.
+
+### Not covered
+
+The guard works on project and time-type names only. The following are returned as stored in Xledger and are **not** filtered:
+
+- **`get_expenses`** returns the expense type per named employee. An expense type can itself be health-related (for example a medical or healthcare expense type).
+- **`get_journal_entries`** returns account names together with employee subledgers. An account name can reveal health information (for example a sick-pay account) for the person on the subledger.
+- Free-text fields (`text`, `comment`, expense report `overview`) on rows the guard does not match.
+
+The deploying organisation must assess these in its DPIA, or restrict access to those tools (for example through the MCP client's tool permissions or the API token's owner-scopes).
 
 ## Tool notes
 
@@ -194,8 +205,8 @@ npm run lint         # Type-check without emitting
 - Never commit tokens to version control. Use user-scoped MCP configuration or environment variables
 - All tools are read-only (no mutations)
 - Use Xledger's token scope controls to limit access to only the data you need
-- Absence data is filtered for GDPR Art. 9 before it leaves the server, in every tool that returns per-person rows: `get_absences`, `get_timesheets`, `get_consultant_profitability`, `get_expenses` and `get_journal_entries` (see [GDPR and absence data](#gdpr-and-absence-data))
-- Free-text fields on non-absence rows (`text`, `comment`, and expense report `overview`) are returned as entered in Xledger and are not filtered
+- Absence project and time-type names are filtered for GDPR Art. 9 before they leave the server in `get_absences`, `get_timesheets`, `get_consultant_profitability`, `get_expenses` and `get_journal_entries` (see [GDPR and absence data](#gdpr-and-absence-data))
+- Expense types, account names with employee subledgers, and free-text fields on rows the guard does not match are returned as entered in Xledger and are not filtered (see [Not covered](#not-covered))
 
 ## License
 

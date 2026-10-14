@@ -1,14 +1,17 @@
 /**
  * Consultant profitability aggregation over timesheet rows.
  *
- * Absence rows count into absenceHours only. They never appear in the
- * per-consultant `projects` breakdown, because an absence project name tied to
- * a named person can reveal health data (GDPR Art. 9). The breakdown includes
- * them under their real name only when the two-key gate in absences.ts is
- * satisfied.
+ * Absence rows (isAbsenceRow: project OR time type, the same predicate as
+ * get_absences and get_timesheets) count into absenceHours only. They never
+ * appear in the per-consultant `projects` breakdown, because an absence
+ * project name tied to a named person can reveal health data (GDPR Art. 9).
+ * Other rows whose project or time type matches a health term (shouldRedact)
+ * are counted normally but listed as "Redacted (billable)" / "Redacted
+ * (non-billable)". Real names are shown only when the two-key gate in
+ * absences.ts is satisfied.
  */
 
-import { isAbsenceProject } from "./absences.js";
+import { REDACTED_LABEL, isAbsenceRow, shouldRedact } from "./absences.js";
 import type { Node } from "./pagination.js";
 
 export interface ProfitabilityOptions {
@@ -56,7 +59,7 @@ export function aggregateConsultants(entries: Node[], opts: ProfitabilityOptions
     const emp = byEmployee[name];
     const hours = parseFloat(entry.workingHours || "0");
     const invHours = parseFloat(entry.invoiceHours || "0");
-    const isAbsence = isAbsenceProject(entry.project?.description);
+    const isAbsence = isAbsenceRow(entry);
     const isBillable = entry.project?.billable === true;
 
     emp.totalHours += hours;
@@ -67,10 +70,13 @@ export function aggregateConsultants(entries: Node[], opts: ProfitabilityOptions
     // Absence stays out of the named project breakdown unless the gate allows it.
     if (isAbsence && !allowAbsenceDetail) continue;
 
-    const projKey = entry.project?.description || "Unknown";
+    const redact = !allowAbsenceDetail && shouldRedact(entry);
+    const projKey = redact
+      ? `${REDACTED_LABEL} (${isBillable ? "billable" : "non-billable"})`
+      : entry.project?.description || "Unknown";
     if (!emp.projects[projKey]) {
       emp.projects[projKey] = {
-        customer: entry.project?.customer?.description || "-",
+        customer: redact ? "-" : entry.project?.customer?.description || "-",
         billable: isBillable,
         hours: 0,
         invoiceHours: 0,

@@ -13,9 +13,14 @@
  * server does not recognise, are collapsed into one anonymous aggregate.
  */
 
-/** Projects whose description marks the row as absence (Swedish + English). */
+/**
+ * Explicit absence terms (Swedish + English), used to COUNT absence hours and
+ * to label rows "Absence". Deliberately narrower than the redaction predicate:
+ * it does not use HEALTH_RE's broad stems ("medical", "temporary", "tillf"),
+ * so a customer project such as "Medical imaging" is not counted as absence.
+ */
 export const ABSENCE_RE =
-  /frånvaro|semester|sjuk|föräldra|vab|tjänstled|permission|absence|vacation|holiday|sick|parental/i;
+  /frånvaro|semester|sjuk|karens|föräldra|vab|vård av barn|tjänstled|ledig|permission|läkar|graviditet|smittbärar|arbetsskada|absence|vacation|holiday|sick|illness|medical leave|parental|paternity|maternity|pregnan|\bleave\b|childcare|child care|care of (a )?(sick )?child|time off/i;
 
 /**
  * Absence types that reveal health information (own or a child's). Checked
@@ -24,22 +29,40 @@ export const ABSENCE_RE =
  * child and must not be disclosed via the parental-leave match.
  */
 export const HEALTH_RE =
-  /sjuk|karens|\bvab\b|vård av barn|tillf|graviditet|smittbärar|sick|illness|medical|pregnan|child care|childcare|care of (a )?(sick )?child|temporary/i;
+  /sjuk|karens|\bvab\b|vård av barn|tillf|graviditet|smittbärar|arbetsskada|läkar|sick|illness|medical|pregnan|child care|childcare|care of (a )?(sick )?child|temporary/i;
 
 /** Absence types positively recognised as non-health. */
 export const NON_HEALTH_RE =
-  /semester|föräldra|komp|tjänstled|vacation|holiday|annual leave|parental|paternity|maternity|time off in lieu|toil|leave of absence/i;
+  /semester|föräldra|komp(ledig|tid|ensationsledig)|tjänstled|vacation|holiday|annual leave|parental|paternity|maternity|time off in lieu|\btoil\b|leave of absence/i;
+
+type NamedRow = {
+  project?: { description?: string } | null;
+  timeType?: { description?: string } | null;
+};
+
+const rowNames = (row: NamedRow) => [row.project?.description || "", row.timeType?.description || ""];
 
 export function isAbsenceProject(projectDescription: string | undefined): boolean {
   return ABSENCE_RE.test(projectDescription || "");
 }
 
-/** A timesheet-like row is absence if its project or its time type is. */
-export function isAbsenceRow(row: {
-  project?: { description?: string } | null;
-  timeType?: { description?: string } | null;
-}): boolean {
-  return isAbsenceProject(row.project?.description) || isAbsenceProject(row.timeType?.description);
+/**
+ * Counting predicate: a timesheet-like row is absence if its project OR its
+ * time type matches an explicit absence term. Used by get_absences,
+ * get_consultant_profitability and for the "Absence" label, so the tools agree.
+ */
+export function isAbsenceRow(row: NamedRow): boolean {
+  return rowNames(row).some((n) => ABSENCE_RE.test(n));
+}
+
+/**
+ * Redaction predicate (fails closed, broad): true if the project OR time type
+ * matches any absence, health or non-health absence term. This errs on the
+ * safe side: a customer project whose name contains e.g. "Medical" or
+ * "Temporary" is redacted too, although it is not counted as absence.
+ */
+export function shouldRedact(row: NamedRow): boolean {
+  return rowNames(row).some((n) => ABSENCE_RE.test(n) || HEALTH_RE.test(n) || NON_HEALTH_RE.test(n));
 }
 
 /** True only for types that may be shown per named employee. */
@@ -97,6 +120,9 @@ export const ART9_ENV_VAR = "XLEDGER_ALLOW_ART9_DETAIL";
 /** Label that replaces absence project and time-type names in per-person rows. */
 export const ABSENCE_LABEL = "Absence";
 
+/** Label for rows redacted because a name matched a health term but the row is not counted as absence. */
+export const REDACTED_LABEL = "Redacted";
+
 type Env = Record<string, string | undefined>;
 
 /**
@@ -125,11 +151,12 @@ export interface RedactionResult<T> {
 }
 
 /**
- * Redact absence rows in per-person row lists (timesheets, expense lines,
- * journal entries). Rows whose project or time type is an absence get their
- * project/time-type names replaced with "Absence" and lose free-text fields,
- * which could otherwise name the absence reason. Hours, dates and the employee
- * stay, so totals still add up. Unless the two-key gate is satisfied.
+ * Redact rows in per-person row lists (timesheets, expense lines, journal
+ * entries). Rows where shouldRedact() is true get their project/time-type
+ * names replaced ("Absence" when isAbsenceRow(), otherwise "Redacted") and
+ * lose free-text fields, which could otherwise name the absence reason.
+ * Hours, dates and the employee stay, so totals still add up. Unless the
+ * two-key gate is satisfied.
  */
 export function redactAbsenceRows<T extends Record<string, any>>(
   rows: T[],
@@ -145,11 +172,12 @@ export function redactAbsenceRows<T extends Record<string, any>>(
   }
   let absenceRowsRedacted = 0;
   const items = rows.map((row) => {
-    if (!isAbsenceRow(row)) return row;
+    if (!shouldRedact(row)) return row;
     absenceRowsRedacted++;
+    const label = isAbsenceRow(row) ? ABSENCE_LABEL : REDACTED_LABEL;
     const out: Record<string, any> = { ...row };
-    if (out.project) out.project = { ...out.project, code: null, description: ABSENCE_LABEL };
-    if (out.timeType) out.timeType = { ...out.timeType, description: ABSENCE_LABEL };
+    if (out.project) out.project = { ...out.project, code: null, description: label };
+    if (out.timeType) out.timeType = { ...out.timeType, description: label };
     for (const f of textFields) delete out[f];
     return out as T;
   });
@@ -167,7 +195,7 @@ export interface Art9GateResult {
 }
 
 export const ABSENCE_REDACTION_NOTE =
-  'GDPR Art. 9: rows booked to absence projects or absence time types have project and time-type names replaced with "Absence" and free-text fields removed, because the absence reason tied to a named person can be health data. Hours and dates are unchanged. Use get_absences for the guarded per-type breakdown.';
+  'GDPR Art. 9: rows whose project or time type names an absence or a health-related term have project and time-type names replaced and free-text fields removed, because the absence reason tied to a named person can be health data. The label is "Absence" for rows counted as absence and "Redacted" for rows redacted only because a name matched a health term (the match errs on the safe side, so some of these are ordinary projects). Hours and dates are unchanged. Use get_absences for the guarded per-type breakdown.';
 
 /**
  * Tool payload for a guarded row list: the plain array when nothing was

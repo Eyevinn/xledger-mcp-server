@@ -4,8 +4,10 @@ import {
   applyArt9Gate,
   guardAbsenceRowsPayload,
   isAbsenceProject,
+  isAbsenceRow,
   isDisclosableAbsenceType,
   redactAbsenceRows,
+  shouldRedact,
   type AbsenceAggregate,
 } from "../src/absences.js";
 
@@ -233,5 +235,107 @@ describe("redactAbsenceRows (get_timesheets / get_expenses / get_journal_entries
     expect(p.items).toHaveLength(3);
     const refused = guardAbsenceRowsPayload([rows[0]], { includeHealthDetail: true, env: {} }) as Record<string, any>;
     expect(typeof refused.healthDetailRefused).toBe("string");
+  });
+});
+
+// Health and leave names that must be treated as absence AND redacted,
+// whether they appear as the project or as the time type.
+const HEALTH_ABSENCE_NAMES = [
+  "Vård av barn",
+  "Karens",
+  "Karensdag",
+  "Illness",
+  "Medical leave",
+  "Läkarbesök",
+  "Graviditetspenning",
+  "Smittbärarpenning",
+  "Arbetsskada",
+  "Ledighet",
+  "Leave",
+  "Childcare",
+];
+
+describe("isAbsenceRow / shouldRedact on every absence name", () => {
+  for (const name of HEALTH_ABSENCE_NAMES) {
+    it(`${name}: absence and redacted as project and as time type`, () => {
+      const asProject = { project: { description: name }, timeType: { description: "Normal" } };
+      const asTimeType = { project: { description: "Intern" }, timeType: { description: name } };
+      expect(isAbsenceRow(asProject)).toBe(true);
+      expect(isAbsenceRow(asTimeType)).toBe(true);
+      expect(shouldRedact(asProject)).toBe(true);
+      expect(shouldRedact(asTimeType)).toBe(true);
+      expect(isDisclosableAbsenceType(name)).toBe(false);
+    });
+  }
+
+  it("timeType-only Sjuk on project Intern is absence", () => {
+    expect(isAbsenceRow({ project: { description: "Intern" }, timeType: { description: "Sjuk" } })).toBe(true);
+  });
+
+  it('customer project "Medical imaging" is redacted (errs safe) but NOT counted as absence', () => {
+    const row = { project: { description: "Medical imaging" }, timeType: { description: "Normal" } };
+    expect(isAbsenceRow(row)).toBe(false);
+    expect(shouldRedact(row)).toBe(true);
+  });
+
+  it("ordinary rows are neither", () => {
+    const row = { project: { description: "Customer project X" }, timeType: { description: "Normal" } };
+    expect(isAbsenceRow(row)).toBe(false);
+    expect(shouldRedact(row)).toBe(false);
+  });
+});
+
+describe("guardAbsenceRowsPayload on every absence name", () => {
+  const rows = [
+    ...HEALTH_ABSENCE_NAMES.map((n) => ts("Person A", n, "Normal")),
+    ...HEALTH_ABSENCE_NAMES.map((n) => ts("Person B", "Intern", n)),
+    ts("Person C", "Intern", "Sjuk"),
+  ];
+
+  it("redacts every row, project or time type, and leaks no name", () => {
+    const p = guardAbsenceRowsPayload(rows, { env: {} }) as Record<string, any>;
+    expect(p.absenceRowsRedacted).toBe(rows.length);
+    for (const row of p.items) {
+      expect(row.project.description).toBe("Absence");
+      expect(row.timeType.description).toBe("Absence");
+      expect(row).not.toHaveProperty("text");
+      expect(row).not.toHaveProperty("comment");
+    }
+    const out = JSON.stringify(p.items);
+    for (const n of [...HEALTH_ABSENCE_NAMES, "Sjuk"]) expect(out).not.toContain(n);
+  });
+
+  it('"Medical imaging" is redacted with the "Redacted" label, not "Absence"', () => {
+    const p = guardAbsenceRowsPayload([ts("Person D", "Medical imaging", "Normal")], { env: {} }) as Record<
+      string,
+      any
+    >;
+    expect(p.absenceRowsRedacted).toBe(1);
+    expect(p.items[0].project.description).toBe("Redacted");
+    expect(p.items[0].timeType.description).toBe("Redacted");
+    expect(JSON.stringify(p.items)).not.toMatch(/Medical/);
+  });
+});
+
+describe("get_absences row selection agrees with the payload guard", () => {
+  it("every absence name, as project or time type, lands in the anonymous aggregate", () => {
+    const tsRows = [
+      ...HEALTH_ABSENCE_NAMES.map((n) => ts("Person A", n, "Normal")),
+      ...HEALTH_ABSENCE_NAMES.map((n) => ts("Person B", "Intern", n)),
+      ts("Person C", "Intern", "Sjuk"),
+      ts("Person D", "Medical imaging", "Normal"),
+    ];
+    // Same selection and absenceType rule as the get_absences tool.
+    const absRows = tsRows.filter(isAbsenceRow).map((n) => ({
+      date: n.assignmentDate,
+      hours: parseFloat(n.workingHours),
+      employee: n.employee.description,
+      email: n.employee.email,
+      absenceType: n.timeType.description || n.project.description,
+    }));
+    expect(absRows).toHaveLength(HEALTH_ABSENCE_NAMES.length * 2 + 1);
+    const r = applyArt9Gate(aggregateAbsences(absRows), { env: {} });
+    expect(JSON.stringify(r.byEmployeeAndType)).not.toMatch(/Person/);
+    expect(r.healthRelatedAbsence?.totalHours).toBe(absRows.length * 8);
   });
 });

@@ -1,13 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { aggregateConsultants } from "../src/profitability.js";
 
-const row = (employee: string, project: string, hours: number, billable: boolean) => ({
+const row = (employee: string, project: string, hours: number, billable: boolean, timeType = "Normal") => ({
   assignmentDate: "2026-03-02",
   workingHours: String(hours),
   invoiceHours: billable ? String(hours) : "0",
   employee: { description: employee, email: "p@example.com" },
   project: { description: project, billable, customer: { description: billable ? "Customer" : "Own company" } },
-  timeType: { description: "Normal" },
+  timeType: { description: timeType },
 });
 
 const entries = [
@@ -44,5 +44,52 @@ describe("aggregateConsultants", () => {
     expect(a.financials.totalRevenue).toBe(120000);
     expect(a.financials.totalCost).toBe(65000);
     expect(a.financials.margin).toBe(55000);
+  });
+});
+
+const HEALTH_ABSENCE_NAMES = [
+  "Vård av barn",
+  "Karens",
+  "Karensdag",
+  "Illness",
+  "Medical leave",
+  "Läkarbesök",
+  "Graviditetspenning",
+  "Smittbärarpenning",
+  "Arbetsskada",
+  "Ledighet",
+  "Leave",
+  "Childcare",
+];
+
+describe("aggregateConsultants: every absence name, project or time type", () => {
+  const rows = [
+    row("Person A", "Customer project X", 100, true),
+    ...HEALTH_ABSENCE_NAMES.map((n) => row("Person A", n, 1, false)),
+    ...HEALTH_ABSENCE_NAMES.map((n) => row("Person A", "Intern", 1, false, n)),
+    row("Person A", "Intern", 2, false, "Sjuk"),
+    row("Person A", "Medical imaging", 10, true),
+  ];
+
+  it("counts all of them as absence and never names them in projects", () => {
+    const [a] = aggregateConsultants(rows, base);
+    expect(a.hours.absence).toBe(HEALTH_ABSENCE_NAMES.length * 2 + 2);
+    expect(a.hours.billable).toBe(110);
+    expect(a.hours.nonBillable).toBe(0);
+    const out = JSON.stringify(a.projects);
+    for (const n of [...HEALTH_ABSENCE_NAMES, "Sjuk", "Intern"]) expect(out).not.toContain(n);
+  });
+
+  it('"Medical imaging" counts as billable, not absence, and is listed as Redacted', () => {
+    const [a] = aggregateConsultants(rows, base);
+    expect(a.projects.map((p) => p.project)).toEqual(["Customer project X", "Redacted (billable)"]);
+    expect(a.projects[1]).toMatchObject({ hours: 10, customer: "-", billable: true });
+    expect(JSON.stringify(a)).not.toMatch(/Medical/);
+  });
+
+  it("two-key gate satisfied: real names shown", () => {
+    const [a] = aggregateConsultants(rows, { ...base, allowAbsenceDetail: true });
+    expect(a.projects.map((p) => p.project)).toContain("Medical imaging");
+    expect(a.projects.map((p) => p.project)).toContain("Läkarbesök");
   });
 });

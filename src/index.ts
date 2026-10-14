@@ -22,7 +22,6 @@ import { gql } from "./graphql.js";
 import { validateDate, today, monthChunks, monthSpan } from "./validation.js";
 import { connNodes, paginateAll, truncationWarning, type Node } from "./pagination.js";
 import {
-  ABSENCE_RE,
   ART9_ENV_VAR,
   INCLUDE_HEALTH_DETAIL_DESCRIPTION,
   aggregateAbsences,
@@ -30,6 +29,7 @@ import {
   art9DetailAllowed,
   art9Refusal,
   guardAbsenceRowsPayload,
+  isAbsenceRow,
   type AbsenceRow,
 } from "./absences.js";
 import { aggregateConsultants } from "./profitability.js";
@@ -268,7 +268,7 @@ server.tool(
 
 server.tool(
   "get_timesheets",
-  `Get timesheet entries from Xledger. Returns hours worked per employee per project with invoice status, hourly cost rate (hourlyCost), and hourly revenue rate (hourlyRevenueCurrency). Use for utilization analysis, billing verification, and profitability analysis. GDPR Art. 9: rows booked to absence projects or absence time types are returned with project and time type shown as "Absence" and without text/comment, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment.`,
+  `Get timesheet entries from Xledger. Returns hours worked per employee per project with invoice status, hourly cost rate (hourlyCost), and hourly revenue rate (hourlyRevenueCurrency). Use for utilization analysis, billing verification, and profitability analysis. GDPR Art. 9: rows whose project or time type names an absence or a health-related term are returned with project and time type shown as "Absence" (rows counted as absence) or "Redacted" (other matches; the match errs on the safe side) and without text/comment, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment.`,
   {
     first: z.number().optional().default(100).describe("Number of records to return (max 500)"),
     fromDate: z.string().optional().describe("Filter from date (YYYY-MM-DD)"),
@@ -322,7 +322,7 @@ server.tool(
 
 server.tool(
   "get_consultant_profitability",
-  `Get consultant profitability analysis from Xledger timesheets. Calculates utilization (billable hours / total hours excluding absence), cost from a monthly salary plus employer social security contributions, and revenue from a provided hourly rate. Returns a per-consultant and per-project breakdown with contribution margin and utilization rate. Absence hours are reported only as hours.absence; absence projects are not listed in the per-consultant project breakdown (GDPR Art. 9) unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment. Salary and hourly rate are inputs because payroll data is usually outside the API token's scope. Amounts are in the company's base currency.`,
+  `Get consultant profitability analysis from Xledger timesheets. Calculates utilization (billable hours / total hours excluding absence), cost from a monthly salary plus employer social security contributions, and revenue from a provided hourly rate. Returns a per-consultant and per-project breakdown with contribution margin and utilization rate. Absence hours (project or time type is an absence, same rule as get_timesheets and get_absences) are reported only as hours.absence; absence projects are not listed in the per-consultant project breakdown, and other projects whose name matches a health-related term are listed as "Redacted (billable)" / "Redacted (non-billable)" (GDPR Art. 9), unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment. Salary and hourly rate are inputs because payroll data is usually outside the API token's scope. Amounts are in the company's base currency.`,
   {
     fromDate: z.string().describe("Period start date (YYYY-MM-DD)"),
     toDate: z.string().describe("Period end date (YYYY-MM-DD)"),
@@ -412,7 +412,7 @@ server.tool(
 
 server.tool(
   "get_journal_entries",
-  `Get journal entries (raw GL transactions) from Xledger. Returns detailed accounting entries with account, amount, date, project. Use for detailed financial analysis. GDPR Art. 9: entries booked to absence projects are returned with the project shown as "Absence" and without text, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment.`,
+  `Get journal entries (raw GL transactions) from Xledger. Returns detailed accounting entries with account, amount, date, project. Use for detailed financial analysis. GDPR Art. 9: entries whose project names an absence or a health-related term are returned with the project shown as "Absence" or "Redacted" and without text, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment. Account names (which can include e.g. sick-pay accounts), employee subledgers and free text on other entries are NOT filtered.`,
   {
     first: z.number().optional().default(50).describe("Number of records to return (max 200)"),
     fromDate: z.string().optional().describe("Created date from (YYYY-MM-DD); postedDate is not filterable"),
@@ -729,7 +729,7 @@ const EXPENSE_SCOPE_NOTE =
 
 server.tool(
   "get_expenses",
-  `Get employee expense lines from Xledger. Returns expense lines with amount, date, employee, expense type, project, and approval status. Use for cost analysis and travel & expense reporting. Results depend on the API token's Expense owner-scope. GDPR Art. 9: lines booked to absence projects are returned with the project shown as "Absence" and without text/comment, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment.`,
+  `Get employee expense lines from Xledger. Returns expense lines with amount, date, employee, expense type, project, and approval status. Use for cost analysis and travel & expense reporting. Results depend on the API token's Expense owner-scope. GDPR Art. 9: lines whose project names an absence or a health-related term are returned with the project shown as "Absence" or "Redacted" and without text/comment, unless includeHealthDetail is set AND ${ART9_ENV_VAR}=1 in the server environment. The expense type per named employee (which can be health-related) and free text on other lines are NOT filtered.`,
   {
     first: z.number().optional().default(100).describe("Number of records to return (max 500)"),
     fromDate: z.string().optional().describe("Filter from date (YYYY-MM-DD)"),
@@ -840,7 +840,7 @@ server.tool(
 
 server.tool(
   "get_absences",
-  `Get employee absences from Xledger, derived from timesheet rows booked to absence projects. Returns absence hours per employee and absence type. GDPR Art. 9: health-related absence types (e.g. sick leave, care of a sick child), and any type not recognised as non-health, are NEVER returned per named employee by default. They are collapsed into one anonymous aggregate (total hours + employee count). Recognised non-health types (vacation, parental leave, time off in lieu, leave of absence) are returned per employee. totalAbsenceHours always includes all absence. Per-person health detail requires ${ART9_ENV_VAR}=1 in the server environment, set by the data controller.`,
+  `Get employee absences from Xledger, derived from timesheet rows whose project or time type is an absence. Returns absence hours per employee and absence type. GDPR Art. 9: health-related absence types (e.g. sick leave, care of a sick child), and any type not recognised as non-health, are NEVER returned per named employee by default. They are collapsed into one anonymous aggregate (total hours + employee count). Recognised non-health types (vacation, parental leave, time off in lieu, leave of absence) are returned per employee. totalAbsenceHours always includes all absence. Per-person health detail requires ${ART9_ENV_VAR}=1 in the server environment, set by the data controller.`,
   {
     first: z.number().optional().default(100).describe("Number of rows to return (max 500)"),
     fromDate: z
@@ -878,7 +878,7 @@ server.tool(
       const nodes = connNodes(data.timesheets);
       if (nodes.length >= TIMESHEET_PAGE) truncatedMonths.push(start.slice(0, 7));
       for (const n of nodes) {
-        if (ABSENCE_RE.test(n.project?.description || "")) {
+        if (isAbsenceRow(n)) {
           rows.push({
             date: n.assignmentDate,
             hours: parseFloat(n.workingHours || "0"),
@@ -896,7 +896,7 @@ server.tool(
     });
 
     return json({
-      source: "Derived from timesheet rows booked to absence projects",
+      source: "Derived from timesheet rows whose project or time type is an absence",
       period: { from, to },
       totalAbsenceHours: Math.round(rows.reduce((s, r) => s + r.hours, 0) * 10) / 10,
       ...(truncatedMonths.length > 0
