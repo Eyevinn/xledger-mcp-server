@@ -156,7 +156,13 @@ The server therefore enforces the following before any data leaves it, instead o
 
 Per-person detail is returned only when the caller sets `includeHealthDetail: true` **and** the server was started with `XLEDGER_ALLOW_ART9_DETAIL=1`. Either one alone is refused, and the response says so (`healthDetailRefused`). The environment variable is a decision for the data controller, made with a documented lawful basis; the assistant cannot set it.
 
-Absence projects and types are matched on common Swedish and English names (for example `Frånvaro`/`Absence`, `Semester`/`Vacation`, `Sjuk`/`Sick`, `Karens`, `VAB`/`Vård av barn`, `Läkarbesök`, `Föräldraledig`/`Parental leave`, `Leave`). Names outside these lists are not recognised as absence. See `src/absences.ts` if your Xledger setup uses other names.
+Absence projects and types are matched on common Swedish and English names. Before matching, every name is normalised (Unicode NFD, diacritics removed, lower case), so `Läkarbesök`, a decomposed (NFD) `Läkarbesök` and the ASCII spelling `Lakarbesok` are treated the same. Covered names include:
+
+- **Counted as absence and never shown per person:** `Sjuk`/`Sick`/`Illness`, `Karens`, `VAB`/`Vård av barn`, `Tillfällig föräldrapenning`/`Temporary parental leave`, `Läkarbesök`/`Läk.`, `Tandläkare`/`Dentist`, `Doctor appointment`, `Medical appointment`, `Medical leave`, `Hospital visit`/`Sjukhusbesök`, `Rehab`, `Närståendepenning`/`Vård av anhörig`, `Graviditetspenning`, `Smittbärarpenning`, `Arbetsskada`/`Occupational injury`, `Childcare`, and unrecognised names such as `Frånvaro`/`Absence`, `Ledighet` or `Leave`.
+- **Counted as absence and shown per person (non-health):** `Semester`/`Vacation`/`Holiday`/`Annual leave`, `Föräldraledig`/`Parental leave`, `Tjänstledig`/`Leave of absence`, `Kompledig`/`Komptid`/`Time off in lieu`/`TOIL`.
+- **Redacted only, not counted:** names containing broader health stems such as `medical`, `hospital`, `doctor`, `psyk`, `injury`, `anhörig`, `temporary` or `tillf`. A customer project like `Medical imaging` is redacted but stays ordinary work. `Kompetensutveckling` is not matched.
+
+In `get_absences`, a row is shown per person only if neither its project nor its time type names a health term and at least one of them is a recognised non-health type; a health term on either name sends the row to the anonymous aggregate. Names outside these lists are not recognised as absence. See `src/absences.ts` if your Xledger setup uses other names.
 
 ### Not covered
 

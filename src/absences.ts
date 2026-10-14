@@ -14,36 +14,51 @@
  */
 
 /**
- * Explicit absence terms (Swedish + English), used to COUNT absence hours and
- * to label rows "Absence". Deliberately narrower than the redaction predicate:
- * it does not use HEALTH_RE's broad stems ("medical", "temporary", "tillf"),
- * so a customer project such as "Medical imaging" is not counted as absence.
+ * Normalise a name before any pattern is tested: Unicode NFD, combining marks
+ * stripped, lower-cased. "Läkarbesök", NFD-decomposed "Läkarbesök" and the
+ * ASCII spelling "Lakarbesok" all become "lakarbesok", so every pattern below
+ * is written in plain ASCII lower case and matches all three forms.
  */
-export const ABSENCE_RE =
-  /frånvaro|semester|sjuk|karens|föräldra|vab|vård av barn|tjänstled|ledig|permission|läkar|graviditet|smittbärar|arbetsskada|absence|vacation|holiday|sick|illness|medical leave|parental|paternity|maternity|pregnan|\bleave\b|childcare|child care|care of (a )?(sick )?child|time off/i;
+export const norm = (s: string | undefined | null): string =>
+  (s || "").normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
 
 /**
- * Absence types that reveal health information (own or a child's). Checked
- * before NON_HEALTH_RE, so health wins: temporary parental benefit/leave
- * ("Tillfällig föräldrapenning", "Temporary parental leave") is care of a sick
- * child and must not be disclosed via the parental-leave match.
+ * Explicit absence terms (Swedish + English, ASCII after norm()), used to
+ * COUNT absence hours and to label rows "Absence". Deliberately narrower than
+ * the redaction predicate: it does not use HEALTH_RE's broad stems ("medical",
+ * "hospital", "temporary", "tillf"), so a customer project such as "Medical
+ * imaging" is not counted as absence.
+ */
+export const ABSENCE_RE =
+  /franvaro|semester|sjuk|karens|foraldra|vab|vard av barn|vard av anhorig|narstaende|tjanstled|ledig|komp(ledig|tid|ensationsledig)|\btoil\b|permission|lakar|\blak\.|tandlak|graviditet|smittbarar|arbetsskada|rehab|absence|vacation|holiday|sick|illness|medical leave|medical appointment|doctor appointment|doctor'?s appointment|dentist|hospital visit|occupational injury|parental|paternity|maternity|pregnan|\bleave\b|childcare|child care|care of (a )?(sick )?child|time off/;
+
+/**
+ * Absence types that reveal health information (own, a child's or a close
+ * relative's). Checked before NON_HEALTH_RE, so health wins: temporary
+ * parental benefit/leave ("Tillfällig föräldrapenning", "Temporary parental
+ * leave") is care of a sick child and must not be disclosed via the
+ * parental-leave match. ASCII after norm().
  */
 export const HEALTH_RE =
-  /sjuk|karens|\bvab\b|vård av barn|tillf|graviditet|smittbärar|arbetsskada|läkar|sick|illness|medical|pregnan|child care|childcare|care of (a )?(sick )?child|temporary/i;
+  /sjuk|karens|\bvab\b|vard av barn|vard av anhorig|tillf|graviditet|smittbarar|arbetsskada|lakar|lak\.|tandlak|narstaende|anhorig|rehab|psyk|doctor|dentist|hospital|injury|sick|illness|medical|pregnan|child care|childcare|care of (a )?(sick )?child|temporary/;
 
-/** Absence types positively recognised as non-health. */
+/** Absence types positively recognised as non-health. ASCII after norm(). */
 export const NON_HEALTH_RE =
-  /semester|föräldra|komp(ledig|tid|ensationsledig)|tjänstled|vacation|holiday|annual leave|parental|paternity|maternity|time off in lieu|\btoil\b|leave of absence/i;
+  /semester|foraldra|komp(ledig|tid|ensationsledig)|tjanstled|vacation|holiday|annual leave|parental|paternity|maternity|time off in lieu|\btoil\b|leave of absence/;
 
 type NamedRow = {
   project?: { description?: string } | null;
   timeType?: { description?: string } | null;
 };
 
-const rowNames = (row: NamedRow) => [row.project?.description || "", row.timeType?.description || ""];
+/** Project and time-type names of a row, normalised with norm(). */
+const rowNames = (row: NamedRow) => [norm(row.project?.description), norm(row.timeType?.description)];
+
+const isHealthName = (n: string) => HEALTH_RE.test(n);
+const isNonHealthName = (n: string) => NON_HEALTH_RE.test(n);
 
 export function isAbsenceProject(projectDescription: string | undefined): boolean {
-  return ABSENCE_RE.test(projectDescription || "");
+  return ABSENCE_RE.test(norm(projectDescription));
 }
 
 /**
@@ -62,13 +77,25 @@ export function isAbsenceRow(row: NamedRow): boolean {
  * "Temporary" is redacted too, although it is not counted as absence.
  */
 export function shouldRedact(row: NamedRow): boolean {
-  return rowNames(row).some((n) => ABSENCE_RE.test(n) || HEALTH_RE.test(n) || NON_HEALTH_RE.test(n));
+  return rowNames(row).some((n) => ABSENCE_RE.test(n) || isHealthName(n) || isNonHealthName(n));
 }
 
 /** True only for types that may be shown per named employee. */
 export function isDisclosableAbsenceType(absenceType: string | undefined): boolean {
-  const t = absenceType || "";
-  return NON_HEALTH_RE.test(t) && !HEALTH_RE.test(t);
+  const t = norm(absenceType);
+  return isNonHealthName(t) && !isHealthName(t);
+}
+
+/**
+ * Row-level disclosability, classified on BOTH the project and the time-type
+ * name: a health term on either name wins, and at least one name must be a
+ * recognised non-health type. get_absences reports one of the two names as
+ * the absence type, so checking only that name would let a health project
+ * with a non-health time type (or the reverse) through.
+ */
+export function isDisclosableAbsenceRow(row: NamedRow): boolean {
+  const names = rowNames(row);
+  return !names.some(isHealthName) && names.some(isNonHealthName);
 }
 
 export interface AbsenceRow {
@@ -77,6 +104,12 @@ export interface AbsenceRow {
   employee: string;
   email: string;
   absenceType: string;
+  /**
+   * Set when the row as a whole is not disclosable (isDisclosableAbsenceRow
+   * false), e.g. a health project booked with a non-health time type. Such
+   * rows always go to the anonymous aggregate, whatever absenceType says.
+   */
+  restricted?: boolean;
 }
 
 export interface AbsenceAggregate {
@@ -87,12 +120,13 @@ export interface AbsenceAggregate {
   days: number;
   firstDate: string;
   lastDate: string;
+  restricted?: boolean;
 }
 
 export function aggregateAbsences(rows: AbsenceRow[]): AbsenceAggregate[] {
   const agg: Record<string, AbsenceAggregate> = {};
   for (const r of rows) {
-    const key = `${r.employee}||${r.absenceType}`;
+    const key = `${r.employee}||${r.absenceType}||${r.restricted ? 1 : 0}`;
     if (!agg[key]) {
       agg[key] = {
         employee: r.employee,
@@ -102,6 +136,7 @@ export function aggregateAbsences(rows: AbsenceRow[]): AbsenceAggregate[] {
         days: 0,
         firstDate: r.date,
         lastDate: r.date,
+        ...(r.restricted ? { restricted: true } : {}),
       };
     }
     agg[key].totalHours += r.hours;
@@ -236,12 +271,14 @@ export function applyArt9Gate(
 ): Art9GateResult {
   const allowDetail = art9DetailAllowed(includeHealthDetail, env);
 
-  const disclosable = aggregates.filter((a) => isDisclosableAbsenceType(a.absenceType));
-  const restricted = aggregates.filter((a) => !isDisclosableAbsenceType(a.absenceType));
+  const isDisclosable = (a: AbsenceAggregate) => !a.restricted && isDisclosableAbsenceType(a.absenceType);
+  const disclosable = aggregates.filter(isDisclosable);
+  const restricted = aggregates.filter((a) => !isDisclosable(a));
 
   const byEmployeeAndType = [...(allowDetail ? aggregates : disclosable)]
     .sort((a, b) => a.employee.localeCompare(b.employee) || b.totalHours - a.totalHours)
-    .slice(0, first);
+    .slice(0, first)
+    .map(({ restricted: _r, ...a }) => a);
 
   const result: Art9GateResult = { byEmployeeAndType };
 

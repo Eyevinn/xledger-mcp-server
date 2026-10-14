@@ -60,7 +60,37 @@ const HEALTH_ABSENCE_NAMES = [
   "Ledighet",
   "Leave",
   "Childcare",
+  // ASCII spellings (no diacritics) and upper case.
+  "Vard av barn",
+  "Lakarbesok",
+  "Smittbararpenning",
+  "Tandlakare",
+  "LAKARBESOK",
+  // NFD-decomposed forms (combining marks), as some exports deliver them.
+  "Läkarbesök".normalize("NFD"),
+  "Vård av barn".normalize("NFD"),
+  "Smittbärarpenning".normalize("NFD"),
+  "Tandläkare".normalize("NFD"),
+  "Närståendepenning".normalize("NFD"),
+  // Further health stems that are also counted as absence.
+  "Tandläkare",
+  "Läk. besök",
+  "Närståendepenning",
+  "Vård av anhörig",
+  "Rehab",
+  "Rehabilitering",
+  "Sjukhusbesök",
+  "Doctor appointment",
+  "Doctor's appointment",
+  "Dentist",
+  "Medical appointment",
+  "Hospital visit",
+  "Occupational injury",
 ];
+
+// Health stems used for redaction only: redacted (errs safe), never disclosed,
+// but not counted as absence, so a customer project with such a name is work.
+const REDACT_ONLY_NAMES = ["Medical imaging", "Hospital systems", "Doctor portal", "Psykiatri", "Injury claims", "Anhörigstöd"];
 
 describe("aggregateConsultants: every absence name, project or time type", () => {
   const rows = [
@@ -91,5 +121,23 @@ describe("aggregateConsultants: every absence name, project or time type", () =>
     const [a] = aggregateConsultants(rows, { ...base, allowAbsenceDetail: true });
     expect(a.projects.map((p) => p.project)).toContain("Medical imaging");
     expect(a.projects.map((p) => p.project)).toContain("Läkarbesök");
+  });
+});
+
+describe("aggregateConsultants: redaction-only health stems", () => {
+  it("count as ordinary work but are listed as Redacted, as project or time type", () => {
+    const rows = [
+      ...REDACT_ONLY_NAMES.map((n) => row("Person B", n, 1, true)),
+      ...REDACT_ONLY_NAMES.map((n) => row("Person B", "Customer project Y", 1, false, n)),
+      row("Person B", "Kompetensutveckling", 4, false),
+    ];
+    const [b] = aggregateConsultants(rows, base);
+    expect(b.hours.absence).toBe(0);
+    expect(b.hours.billable).toBe(REDACT_ONLY_NAMES.length);
+    expect(b.projects.map((p) => p.project).sort()).toEqual(
+      ["Kompetensutveckling", "Redacted (billable)", "Redacted (non-billable)"].sort()
+    );
+    const out = JSON.stringify(b);
+    for (const n of REDACT_ONLY_NAMES) expect(out).not.toContain(n);
   });
 });

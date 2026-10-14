@@ -30,6 +30,7 @@ import {
   art9Refusal,
   guardAbsenceRowsPayload,
   isAbsenceRow,
+  isDisclosableAbsenceRow,
   type AbsenceRow,
 } from "./absences.js";
 import { aggregateConsultants } from "./profitability.js";
@@ -885,6 +886,8 @@ server.tool(
             employee: n.employee?.description || "Unknown",
             email: n.employee?.email || "",
             absenceType: n.timeType?.description || n.project?.description || "Absence",
+            // Classify on both names: a health project with a non-health time type stays aggregated.
+            ...(isDisclosableAbsenceRow(n) ? {} : { restricted: true }),
           });
         }
       }

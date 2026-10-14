@@ -5,7 +5,9 @@ import {
   guardAbsenceRowsPayload,
   isAbsenceProject,
   isAbsenceRow,
+  isDisclosableAbsenceRow,
   isDisclosableAbsenceType,
+  norm,
   redactAbsenceRows,
   shouldRedact,
   type AbsenceAggregate,
@@ -253,7 +255,37 @@ const HEALTH_ABSENCE_NAMES = [
   "Ledighet",
   "Leave",
   "Childcare",
+  // ASCII spellings (no diacritics) and upper case.
+  "Vard av barn",
+  "Lakarbesok",
+  "Smittbararpenning",
+  "Tandlakare",
+  "LAKARBESOK",
+  // NFD-decomposed forms (combining marks), as some exports deliver them.
+  "Läkarbesök".normalize("NFD"),
+  "Vård av barn".normalize("NFD"),
+  "Smittbärarpenning".normalize("NFD"),
+  "Tandläkare".normalize("NFD"),
+  "Närståendepenning".normalize("NFD"),
+  // Further health stems that are also counted as absence.
+  "Tandläkare",
+  "Läk. besök",
+  "Närståendepenning",
+  "Vård av anhörig",
+  "Rehab",
+  "Rehabilitering",
+  "Sjukhusbesök",
+  "Doctor appointment",
+  "Doctor's appointment",
+  "Dentist",
+  "Medical appointment",
+  "Hospital visit",
+  "Occupational injury",
 ];
+
+// Health stems used for redaction only: redacted (errs safe), never disclosed,
+// but not counted as absence, so a customer project with such a name is work.
+const REDACT_ONLY_NAMES = ["Medical imaging", "Hospital systems", "Doctor portal", "Psykiatri", "Injury claims", "Anhörigstöd"];
 
 describe("isAbsenceRow / shouldRedact on every absence name", () => {
   for (const name of HEALTH_ABSENCE_NAMES) {
@@ -337,5 +369,105 @@ describe("get_absences row selection agrees with the payload guard", () => {
     const r = applyArt9Gate(aggregateAbsences(absRows), { env: {} });
     expect(JSON.stringify(r.byEmployeeAndType)).not.toMatch(/Person/);
     expect(r.healthRelatedAbsence?.totalHours).toBe(absRows.length * 8);
+  });
+});
+
+describe("normalisation", () => {
+  it("norm() strips diacritics from precomposed and NFD input and lower-cases", () => {
+    expect(norm("Läkarbesök")).toBe("lakarbesok");
+    expect(norm("Läkarbesök".normalize("NFD"))).toBe("lakarbesok");
+    expect(norm("VÅRD AV BARN")).toBe("vard av barn");
+    expect(norm(undefined)).toBe("");
+  });
+
+  it("non-health types are disclosable in precomposed, NFD and ASCII form", () => {
+    for (const t of [
+      "Föräldraledig",
+      "Föräldraledig".normalize("NFD"),
+      "Foraldraledig",
+      "Tjänstledig".normalize("NFD"),
+      "Tjanstledig",
+      "Kompledig",
+      "Komptid",
+      "TOIL",
+    ]) {
+      expect(isDisclosableAbsenceType(t)).toBe(true);
+      expect(isAbsenceRow({ project: { description: "Intern" }, timeType: { description: t } })).toBe(true);
+    }
+  });
+
+  it("temporary parental benefit in NFD or ASCII form is still health", () => {
+    for (const t of ["Tillfällig föräldrapenning".normalize("NFD"), "Tillfallig foraldrapenning"]) {
+      expect(isDisclosableAbsenceType(t)).toBe(false);
+    }
+  });
+
+  it('"Kompetensutveckling" is neither absence nor redacted', () => {
+    const row = { project: { description: "Kompetensutveckling" }, timeType: { description: "Normal" } };
+    expect(isAbsenceRow(row)).toBe(false);
+    expect(shouldRedact(row)).toBe(false);
+    expect(guardAbsenceRowsPayload([ts("Person K", "Kompetensutveckling", "Normal")], { env: {} })).toHaveLength(1);
+  });
+});
+
+describe("redaction-only health stems", () => {
+  for (const name of REDACT_ONLY_NAMES) {
+    it(`${name}: redacted as project and as time type, not counted, never disclosed`, () => {
+      const asProject = { project: { description: name }, timeType: { description: "Normal" } };
+      const asTimeType = { project: { description: "Customer project X" }, timeType: { description: name } };
+      expect(isAbsenceRow(asProject)).toBe(false);
+      expect(isAbsenceRow(asTimeType)).toBe(false);
+      expect(shouldRedact(asProject)).toBe(true);
+      expect(shouldRedact(asTimeType)).toBe(true);
+      expect(isDisclosableAbsenceType(name)).toBe(false);
+      const p = guardAbsenceRowsPayload([ts("Person R", name, "Normal"), ts("Person R", "Intern", name)], {
+        env: {},
+      }) as Record<string, any>;
+      expect(p.absenceRowsRedacted).toBe(2);
+      for (const row of p.items) expect(row.project.description).toBe("Redacted");
+      expect(JSON.stringify(p.items)).not.toContain(name);
+    });
+  }
+});
+
+describe("disclosability is classified on both project and time type", () => {
+  it("health on either name wins", () => {
+    const row = (project: string, timeType: string) => ({
+      project: { description: project },
+      timeType: { description: timeType },
+    });
+    expect(isDisclosableAbsenceRow(row("Sjukfrånvaro", "Semester"))).toBe(false);
+    expect(isDisclosableAbsenceRow(row("Semester", "Sjukdag"))).toBe(false);
+    expect(isDisclosableAbsenceRow(row("Läkarbesök".normalize("NFD"), "Vacation"))).toBe(false);
+    expect(isDisclosableAbsenceRow(row("Frånvaro", "Semester"))).toBe(true);
+    expect(isDisclosableAbsenceRow(row("Frånvaro", "Normal"))).toBe(false);
+  });
+
+  it("get_absences: a health project booked with a non-health time type stays aggregated", () => {
+    const tsRows = [
+      ts("Person S", "Sjukfrånvaro", "Semester"),
+      ts("Person T", "Frånvaro", "Semester"),
+      ts("Person U", "Vård av barn".normalize("NFD"), "Föräldraledig"),
+    ];
+    // Same selection, absenceType and restricted rule as the get_absences tool.
+    const absRows = tsRows.filter(isAbsenceRow).map((n) => ({
+      date: n.assignmentDate,
+      hours: parseFloat(n.workingHours),
+      employee: n.employee.description,
+      email: n.employee.email,
+      absenceType: n.timeType.description || n.project.description,
+      ...(isDisclosableAbsenceRow(n) ? {} : { restricted: true }),
+    }));
+    const r = applyArt9Gate(aggregateAbsences(absRows), { env: {} });
+    expect(names(r)).toEqual(["Person T/Semester"]);
+    expect(r.byEmployeeAndType[0]).not.toHaveProperty("restricted");
+    expect(r.healthRelatedAbsence?.totalHours).toBe(16);
+    expect(r.healthRelatedAbsence?.employeeCount).toBe(2);
+    const full = applyArt9Gate(aggregateAbsences(absRows), {
+      includeHealthDetail: true,
+      env: { XLEDGER_ALLOW_ART9_DETAIL: "1" },
+    });
+    expect(full.byEmployeeAndType).toHaveLength(3);
+    for (const a of full.byEmployeeAndType) expect(a).not.toHaveProperty("restricted");
   });
 });
